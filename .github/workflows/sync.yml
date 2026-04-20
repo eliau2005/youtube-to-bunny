@@ -1,6 +1,6 @@
 name: Sync YouTube to Bunny
 on:
-  workflow_dispatch: # מאפשר לך להפעיל ידנית בלחיצת כפתור
+  workflow_dispatch:
 
 jobs:
   sync:
