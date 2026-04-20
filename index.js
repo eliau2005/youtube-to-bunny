@@ -33,7 +33,8 @@ async function uploadToBunny(video) {
         console.log(`\n--- Processing: ${video.title} ---`);
         
         // הורדה בשרת של GitHub (מהירות פסיכית)
-        execSync(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "https://www.youtube.com/watch?v=${video.id}"`);
+        const cookiesArg = fs.existsSync('cookies.txt') ? '--cookies cookies.txt' : '';
+        execSync(`yt-dlp --js-runtimes nodejs ${cookiesArg} -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "https://www.youtube.com/watch?v=${video.id}"`);
 
         // יצירת רשומה בבאני
         const createRes = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`, 
