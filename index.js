@@ -34,7 +34,7 @@ async function uploadToBunny(video) {
         
         // הורדה בשרת של GitHub (מהירות פסיכית)
         const cookiesArg = fs.existsSync('cookies.txt') && fs.statSync('cookies.txt').size > 10 ? '--cookies cookies.txt' : '';
-        execSync(`yt-dlp --js-runtimes nodejs ${cookiesArg} -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "https://www.youtube.com/watch?v=${video.id}"`);
+        execSync(`yt-dlp --js-runtimes node ${cookiesArg} -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "https://www.youtube.com/watch?v=${video.id}"`);
 
         // יצירת רשומה בבאני
         const createRes = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`, 
