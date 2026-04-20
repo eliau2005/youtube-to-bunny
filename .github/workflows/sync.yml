@@ -1,0 +1,29 @@
+name: Sync YouTube to Bunny
+on:
+  workflow_dispatch: # מאפשר לך להפעיל ידנית בלחיצת כפתור
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install Dependencies
+        run: |
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          sudo apt-get install -y ffmpeg
+          npm install axios
+
+      - name: Run Sync Script
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          BUNNY_LIBRARY_ID: ${{ secrets.BUNNY_LIBRARY_ID }}
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
+          PLAYLIST_ID: ${{ secrets.PLAYLIST_ID }}
+        run: node index.js
