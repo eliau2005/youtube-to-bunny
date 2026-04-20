@@ -33,7 +33,7 @@ async function uploadToBunny(video) {
         console.log(`\n--- Processing: ${video.title} ---`);
         
         // הורדה בשרת של GitHub (מהירות פסיכית)
-        const cookiesArg = fs.existsSync('cookies.txt') ? '--cookies cookies.txt' : '';
+        const cookiesArg = fs.existsSync('cookies.txt') && fs.statSync('cookies.txt').size > 10 ? '--cookies cookies.txt' : '';
         execSync(`yt-dlp --js-runtimes nodejs ${cookiesArg} -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "https://www.youtube.com/watch?v=${video.id}"`);
 
         // יצירת רשומה בבאני
