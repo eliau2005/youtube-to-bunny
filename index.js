@@ -77,11 +77,11 @@ async function processVideo(videoObj) {
         );
         const guid = createRes.data.guid;
 
-        // 4. הורדה מיוטיוב לשרת גיטהאב
-        console.log(`📥 מוריד מיוטיוב...`);
-        execSync(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
-
-        // 5. העלאה לבאני
+      // 4. הורדה מיוטיוב לשרת גיטהאב (עם Cookies!)
+        console.log(`📥 מוריד מיוטיוב (עם אימות)...`);
+        execSync(`yt-dlp --cookies cookies.txt -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
+       
+     // 5. העלאה לבאני
         console.log(`⬆️ מעלה ל-Bunny...`);
         const fileStream = fs.createReadStream(tmpFile);
         await axios.put(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos/${guid}`, fileStream, {

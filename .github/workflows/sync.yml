@@ -1,12 +1,12 @@
 name: Process JSON and Sync to Bunny
 on:
-  workflow_dispatch: # הפעלה ידנית
+  workflow_dispatch:
 
 jobs:
   process-and-sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # חובה כדי שהאקשן יוכל לשמור את הקובץ המעודכן בגיטהאב
+      contents: write
       
     steps:
       - name: Checkout Code
@@ -23,6 +23,11 @@ jobs:
           sudo chmod a+rx /usr/local/bin/yt-dlp
           sudo apt-get install -y ffmpeg
           npm install axios
+
+      - name: Create Cookies File
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: echo "$YOUTUBE_COOKIES" > cookies.txt
 
       - name: Run Processing Script
         env:
