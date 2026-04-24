@@ -77,10 +77,10 @@ async function processVideo(videoObj) {
         );
         const guid = createRes.data.guid;
 
-      // 4. הורדה מיוטיוב לשרת גיטהאב (עם Cookies!)
-        console.log(`📥 מוריד מיוטיוב (עם אימות)...`);
-        execSync(`yt-dlp --cookies cookies.txt -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
-       
+     // 4. הורדה מיוטיוב לשרת גיטהאב (עם עקיפת חסימות ואנדרואיד)
+        console.log(`📥 מוריד מיוטיוב (עוקף חסימות JS)...`);
+        execSync(`yt-dlp --cookies cookies.txt --js-runtimes node --extractor-args "youtube:player_client=android,web" -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
+
      // 5. העלאה לבאני
         console.log(`⬆️ מעלה ל-Bunny...`);
         const fileStream = fs.createReadStream(tmpFile);
