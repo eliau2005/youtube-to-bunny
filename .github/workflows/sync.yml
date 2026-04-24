@@ -1,13 +1,17 @@
-name: Sync YouTube to Bunny
+name: Process JSON and Sync to Bunny
 on:
-  workflow_dispatch:
+  workflow_dispatch: # הפעלה ידנית
 
 jobs:
-  sync:
+  process-and-sync:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
+    permissions:
+      contents: write # חובה כדי שהאקשן יוכל לשמור את הקובץ המעודכן בגיטהאב
       
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
       - name: Set up Node.js
         uses: actions/setup-node@v3
         with:
@@ -20,13 +24,16 @@ jobs:
           sudo apt-get install -y ffmpeg
           npm install axios
 
-      - name: Write YouTube cookies
-        run: echo "${{ secrets.YOUTUBE_COOKIES }}" > cookies.txt
-
-      - name: Run Sync Script
+      - name: Run Processing Script
         env:
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           BUNNY_LIBRARY_ID: ${{ secrets.BUNNY_LIBRARY_ID }}
           BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
-          PLAYLIST_ID: ${{ secrets.PLAYLIST_ID }}
         run: node index.js
+
+      - name: Commit and Push Updated JSON
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add playlist.json
+          git commit -m "chore: update playlist.json with Bunny CDN links [skip ci]" || echo "No changes to commit"
+          git push
