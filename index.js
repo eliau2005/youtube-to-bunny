@@ -77,11 +77,11 @@ async function processVideo(videoObj) {
         );
         const guid = createRes.data.guid;
 
-     // 4. הורדה מיוטיוב לשרת גיטהאב (עם עקיפת חסימות ואנדרואיד)
+        // 4. הורדה מיוטיוב לשרת גיטהאב (עם עקיפת חסימות ואנדרואיד)
         console.log(`📥 מוריד מיוטיוב (עוקף חסימות JS)...`);
         execSync(`yt-dlp --cookies cookies.txt --js-runtimes node --extractor-args "youtube:player_client=android,web" -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
 
-     // 5. העלאה לבאני
+        // 5. העלאה לבאני
         console.log(`⬆️ מעלה ל-Bunny...`);
         const fileStream = fs.createReadStream(tmpFile);
         await axios.put(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos/${guid}`, fileStream, {
@@ -89,12 +89,9 @@ async function processVideo(videoObj) {
             maxContentLength: Infinity, maxBodyLength: Infinity
         });
 
-        // 6. עדכון האובייקט - מחיקת יוטיוב והוספת קישור באני
+        // 6. עדכון האובייקט - שומר על המבנה הקיים ורק מחליף את הערך של ה-URL
         const bunnyStreamUrl = `https://iframe.mediadelivery.net/play/${BUNNY_LIBRARY_ID}/${guid}`;
-        
-        delete videoObj.youtubeUrl; // מוחק את הקישור הישן
-        videoObj.bunnyUrl = bunnyStreamUrl; // מוסיף את הקישור החדש של באני סטרימינג
-        videoObj.bunnyVideoId = guid; // שומר גם את המזהה הייחודי למקרה שתצטרך API עתידי
+        videoObj.youtubeUrl = bunnyStreamUrl; 
 
         console.log(`✅ הושלם: ${videoObj.lessonTitle}`);
         return videoObj;
@@ -124,21 +121,22 @@ async function run() {
 
     let updatedPlaylist = [];
 
-    // מעבר סדרתי (חשוב לא לעשות במקביל כדי לא לחרוג מהגבלות API)
+    // מעבר סדרתי
     for (const video of playlistData) {
-        // אם כבר יש לו bunnyUrl, נדלג (מאפשר להריץ שוב אם משהו נכשל באמצע)
-        if (video.bunnyUrl) {
+        // בודק אם ה-URL הנוכחי הוא כבר של באני כדי לדלג עליו
+        if (video.youtubeUrl && video.youtubeUrl.includes('mediadelivery.net')) {
             console.log(`⏭️ מדלג, כבר עבר ל-Bunny: ${video.lessonTitle}`);
             updatedPlaylist.push(video);
             continue;
         }
+        
         const updatedVideo = await processVideo(video);
         updatedPlaylist.push(updatedVideo);
     }
 
     // שמירת ה-JSON המעודכן בחזרה לקובץ
     fs.writeFileSync(filePath, JSON.stringify(updatedPlaylist, null, 2));
-    console.log('\n✨ הסנכרון הסתיים והקובץ העודכן נשמר בהצלחה!');
+    console.log('\n✨ הסנכרון הסתיים והקובץ המעודכן נשמר בהצלחה!');
 }
 
 run();
