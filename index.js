@@ -52,7 +52,6 @@ async function getOrCreateCollection(name) {
  * העלאת הוידאו ועדכון מטא-דאטה
  */
 async function processVideo(videoObj) {
-    const rawFile = path.join(__dirname, `${videoObj.videoId}.raw.mp4`);
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
     try {
         console.log(`\n--- מעבד: ${videoObj.lessonTitle} ---`);
@@ -78,17 +77,11 @@ async function processVideo(videoObj) {
         );
         const guid = createRes.data.guid;
 
-        // 4. הורדה מיוטיוב עד 1080p לקובץ גלם
-        console.log(`📥 מוריד מיוטיוב (עד 1080p)...`);
-        execSync(`yt-dlp --cookies cookies.txt --js-runtimes node -f "bestvideo[height<=1080]+bestaudio/best[height<=1080]" --merge-output-format mp4 -o "${rawFile}" "${videoObj.youtubeUrl}"`);
+        // 4. הורדה מיוטיוב באיכות המקסימלית (1080p) והמרה ל-MP4
+        console.log(`📥 מוריד מיוטיוב באיכות מקסימלית...`);
+        execSync(`yt-dlp --cookies cookies.txt --js-runtimes node -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
 
-        // 5. אופטימיזציית FFmpeg עבור תוכן הרצאה (טקסט/דובר סטטי)
-        console.log(`🎬 מבצע אופטימיזציית FFmpeg (CRF 24, preset superfast, stillimage)...`);
-        execSync(`ffmpeg -y -i "${rawFile}" -c:v libx264 -crf 24 -preset superfast -tune stillimage -r 24 -c:a aac -b:a 128k "${tmpFile}"`);
-
-        if (fs.existsSync(rawFile)) fs.unlinkSync(rawFile);
-
-        // 6. העלאה לבאני
+        // 5. העלאה לבאני
         console.log(`⬆️ מעלה ל-Bunny...`);
         const fileStream = fs.createReadStream(tmpFile);
         await axios.put(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos/${guid}`, fileStream, {
@@ -107,7 +100,6 @@ async function processVideo(videoObj) {
         console.error(`❌ נכשל בוידאו ${videoObj.lessonTitle}:`, e.message);
         return videoObj; // נחזיר את האובייקט המקורי כדי שלא יעלם מה-JSON במקרה של שגיאה
     } finally {
-        if (fs.existsSync(rawFile)) fs.unlinkSync(rawFile);
         if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
     }
 }
