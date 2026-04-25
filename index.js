@@ -83,8 +83,8 @@ async function processVideo(videoObj) {
         execSync(`yt-dlp --cookies cookies.txt --js-runtimes node -f "bestvideo[height<=1080]+bestaudio/best[height<=1080]" --merge-output-format mp4 -o "${rawFile}" "${videoObj.youtubeUrl}"`);
 
         // 5. אופטימיזציית FFmpeg עבור תוכן הרצאה (טקסט/דובר סטטי)
-        console.log(`🎬 מבצע אופטימיזציית FFmpeg (CRF 24, preset slow, stillimage)...`);
-        execSync(`ffmpeg -y -i "${rawFile}" -c:v libx264 -crf 24 -preset slow -tune stillimage -r 24 -c:a aac -b:a 128k "${tmpFile}"`);
+        console.log(`🎬 מבצע אופטימיזציית FFmpeg (CRF 24, preset superfast, stillimage)...`);
+        execSync(`ffmpeg -y -i "${rawFile}" -c:v libx264 -crf 24 -preset superfast -tune stillimage -r 24 -c:a aac -b:a 128k "${tmpFile}"`);
 
         if (fs.existsSync(rawFile)) fs.unlinkSync(rawFile);
 
