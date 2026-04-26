@@ -88,11 +88,13 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
     return new Promise((resolve, reject) => {
         const args = [
             '--downloader', 'aria2c',
-            '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M',
+            '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
             '--extractor-args', 'youtube:player_client=ios,android',
             '--js-runtimes', 'node',
             '-f', 'bestvideo[height<=1080]+bestaudio/best',
             '--merge-output-format', 'mp4',
+            '--newline',
+            '--progress-template', 'PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.status)s',
             '-o', outputFile,
             youtubeUrl
         ];
@@ -103,7 +105,17 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
 
         const handleLine = (line) => {
             if (!line) return;
-            if (line.startsWith('[#')) {
+            if (line.startsWith('PROGRESS|')) {
+                const parts = line.split('|');
+                const percentStr = (parts[1] || '').trim();
+                const speedStr = (parts[2] || '').trim();
+                const etaStr = (parts[3] || '').trim();
+                const percent = parseFloat(percentStr.replace('%', ''));
+                if (!isNaN(percent)) {
+                    renderProgressBar('Downloading', percent, speedStr || 'N/A', etaStr || '--:--');
+                    activeBar = true;
+                }
+            } else if (line.startsWith('[#')) {
                 const pctMatch = line.match(/\((\d+(?:\.\d+)?)%\)/);
                 if (pctMatch) {
                     const dlMatch = line.match(/DL:(\S+?)(?=[\s\]])/);
