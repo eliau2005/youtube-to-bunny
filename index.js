@@ -87,6 +87,7 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
             '--js-runtimes', 'node',
             '-f', 'bestvideo+bestaudio/best',
             '--merge-output-format', 'mp4',
+            '-N', '8',
             '--newline',
             '--progress-template', 'PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.status)s',
             '-o', outputFile,
