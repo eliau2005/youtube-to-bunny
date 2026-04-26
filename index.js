@@ -89,9 +89,9 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
         const args = [
             '--downloader', 'aria2c',
             '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
-            '--extractor-args', 'youtube:player_client=ios,android',
+            '--extractor-args', 'youtube:player_client=web,web_embedded',
             '--js-runtimes', 'node',
-            '-f', 'bestvideo[height<=1080]+bestaudio/best',
+            '-f', 'bestvideo[height=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
             '--merge-output-format', 'mp4',
             '--newline',
             '--progress-template', 'PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.status)s',
