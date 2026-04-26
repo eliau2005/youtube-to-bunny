@@ -59,7 +59,7 @@ async function processVideo(videoObj) {
         // 1. הורדה מיוטיוב באיכות המקסימלית (1080p) והמרה ל-MP4
         // אנחנו עושים זאת קודם כדי לא ליצור רשומות ריקות בבאני אם ההורדה נכשלת (למשל עוגיות שפגו)
         console.log(`📥 מוריד מיוטיוב באיכות מקסימלית...`);
-        execSync(`yt-dlp --extractor-args "youtube:player_client=web_embedded" --js-runtimes node -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
+        execSync(`yt-dlp --extractor-args "youtube:player_client=android_vr" --js-runtimes node -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
 
         // 2. קבלת Collection ID לפי התת-קטגוריה
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
