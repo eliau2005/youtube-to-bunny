@@ -5,9 +5,9 @@ const path = require('path');
 
 const { BUNNY_LIBRARY_ID, BUNNY_API_KEY } = process.env;
 
-const headers = { 
-    'AccessKey': BUNNY_API_KEY, 
-    'Content-Type': 'application/json' 
+const headers = {
+    'AccessKey': BUNNY_API_KEY,
+    'Content-Type': 'application/json'
 };
 
 // אובייקט לשמירת ה-Collections שכבר קיימים כדי לא ליצור כפילויות
@@ -36,8 +36,8 @@ async function getOrCreateCollection(name) {
 
     console.log(`📁 יוצר קולקשן חדש בבאני: ${name}`);
     try {
-        const res = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/collections`, 
-            { name }, 
+        const res = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/collections`,
+            { name },
             { headers }
         );
         collectionsMap[name] = res.data.guid;
@@ -55,11 +55,11 @@ async function processVideo(videoObj) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
     try {
         console.log(`\n--- מעבד: ${videoObj.lessonTitle} ---`);
-        
+
         // 1. הורדה מיוטיוב באיכות המקסימלית (1080p) והמרה ל-MP4
         // אנחנו עושים זאת קודם כדי לא ליצור רשומות ריקות בבאני אם ההורדה נכשלת (למשל עוגיות שפגו)
         console.log(`📥 מוריד מיוטיוב באיכות מקסימלית...`);
-        execSync(`yt-dlp --extractor-args "youtube:player_client=android,web" --js-runtimes node -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
+        execSync(`yt-dlp --extractor-args "youtube:player_client=web_embedded" --js-runtimes node -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
 
         // 2. קבלת Collection ID לפי התת-קטגוריה
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
@@ -72,12 +72,12 @@ async function processVideo(videoObj) {
 
         // 4. יצירת רשומה בבאני עם הכותרת החדשה, הקולקשן והמטא-דאטה
         console.log(`🔑 יוצר רשומת וידאו...`);
-        const createRes = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`, 
-            { 
-                title: videoObj.lessonTitle, 
+        const createRes = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`,
+            {
+                title: videoObj.lessonTitle,
                 collectionId: collectionId || "",
                 metaTags: metaTags
-            }, 
+            },
             { headers }
         );
         const guid = createRes.data.guid;
@@ -92,7 +92,7 @@ async function processVideo(videoObj) {
 
         // 6. עדכון האובייקט - שומר על המבנה הקיים ורק מחליף את הערך של ה-URL
         const bunnyStreamUrl = `https://iframe.mediadelivery.net/play/${BUNNY_LIBRARY_ID}/${guid}`;
-        videoObj.youtubeUrl = bunnyStreamUrl; 
+        videoObj.youtubeUrl = bunnyStreamUrl;
 
         console.log(`✅ הושלם: ${videoObj.lessonTitle}`);
         return { success: true, videoObj };
@@ -132,7 +132,7 @@ async function run() {
             updatedPlaylist.push(video);
             continue;
         }
-        
+
         const result = await processVideo(video);
         updatedPlaylist.push(result.videoObj);
 
@@ -141,7 +141,7 @@ async function run() {
             // נוסיף את שאר הסרטונים שנשארו ללא שינוי
             const remaining = playlistData.slice(i + 1);
             updatedPlaylist.push(...remaining);
-            break; 
+            break;
         }
     }
 
