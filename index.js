@@ -76,6 +76,10 @@ async function getOrCreateCollection(name) {
         return res.data.guid;
     } catch (e) {
         console.error(`Failed to create collection ${name}:`, e.message);
+        if (e.response) {
+            console.error('  status:', e.response.status);
+            console.error('  body:', JSON.stringify(e.response.data));
+        }
         return null;
     }
 }
@@ -217,6 +221,10 @@ async function processVideo(videoObj) {
 
     } catch (e) {
         console.error(`Failed on video ${videoObj.lessonTitle}:`, e.message);
+        if (e.response) {
+            console.error('  status:', e.response.status);
+            console.error('  body:', JSON.stringify(e.response.data));
+        }
         return { success: false, videoObj };
     } finally {
         if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
