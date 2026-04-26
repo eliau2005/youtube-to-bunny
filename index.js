@@ -83,13 +83,12 @@ async function getOrCreateCollection(name) {
 function downloadFromYoutube(youtubeUrl, outputFile) {
     return new Promise((resolve, reject) => {
         const args = [
-            '--extractor-args', 'youtube:player_client=web_embedded',
+            '--downloader', 'aria2c',
+            '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M',
+            '--extractor-args', 'youtube:player_client=ios,android',
             '--js-runtimes', 'node',
-            '-f', 'bestvideo+bestaudio/best',
+            '-f', 'bestvideo[height<=1080]+bestaudio/best',
             '--merge-output-format', 'mp4',
-            '-N', '8',
-            '--newline',
-            '--progress-template', 'PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.status)s',
             '-o', outputFile,
             youtubeUrl
         ];
