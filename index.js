@@ -1,7 +1,8 @@
 const axios = require('axios');
-const { execSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 
 const { BUNNY_LIBRARY_ID, BUNNY_API_KEY } = process.env;
 
@@ -10,12 +11,46 @@ const headers = {
     'Content-Type': 'application/json'
 };
 
-// אובייקט לשמירת ה-Collections שכבר קיימים כדי לא ליצור כפילויות
 let collectionsMap = {};
 
-/**
- * משיכת כל ה-Collections הקיימים בבאני
- */
+function formatBytes(bytes) {
+    if (!isFinite(bytes) || bytes < 0) return '0 B';
+    if (bytes < 1024) return bytes.toFixed(0) + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+function formatSpeed(bytesPerSec) {
+    return formatBytes(bytesPerSec) + '/s';
+}
+
+function formatEta(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '--:--';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function renderProgressBar(label, percent, speed, eta) {
+    const barWidth = 30;
+    const clamped = Math.max(0, Math.min(100, percent));
+    const filled = Math.round(barWidth * clamped / 100);
+    const bar = '█'.repeat(filled) + '░'.repeat(barWidth - filled);
+    const line = `${label} [${bar}] ${clamped.toFixed(1).padStart(5)}% | ${speed} | ETA ${eta}`;
+    if (process.stdout.isTTY) {
+        readline.clearLine(process.stdout, 0);
+        readline.cursorTo(process.stdout, 0);
+        process.stdout.write(line);
+    } else {
+        process.stdout.write(line + '\n');
+    }
+}
+
+function endProgressLine() {
+    if (process.stdout.isTTY) process.stdout.write('\n');
+}
+
 async function loadCollections() {
     try {
         const res = await axios.get(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/collections?itemsPerPage=100`, { headers });
@@ -23,18 +58,15 @@ async function loadCollections() {
             collectionsMap[c.name] = c.guid;
         });
     } catch (e) {
-        console.error("שגיאה בטעינת קולקשנים:", e.message);
+        console.error('Error loading collections:', e.message);
     }
 }
 
-/**
- * קבלת מזהה קולקשן (או יצירה של חדש אם לא קיים)
- */
 async function getOrCreateCollection(name) {
     if (!name) return null;
-    if (collectionsMap[name]) return collectionsMap[name]; // קיים
+    if (collectionsMap[name]) return collectionsMap[name];
 
-    console.log(`📁 יוצר קולקשן חדש בבאני: ${name}`);
+    console.log(`Creating new Bunny collection: ${name}`);
     try {
         const res = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/collections`,
             { name },
@@ -43,92 +75,172 @@ async function getOrCreateCollection(name) {
         collectionsMap[name] = res.data.guid;
         return res.data.guid;
     } catch (e) {
-        console.error(`❌ שגיאה ביצירת קולקשן ${name}:`, e.message);
+        console.error(`Failed to create collection ${name}:`, e.message);
         return null;
     }
 }
 
-/**
- * הורדה מיוטיוב, העלאה לבאני ועדכון מטא-דאטה
- */
+function downloadFromYoutube(youtubeUrl, outputFile) {
+    return new Promise((resolve, reject) => {
+        const args = [
+            '--extractor-args', 'youtube:player_client=web_embedded',
+            '--js-runtimes', 'node',
+            '-f', 'bestvideo+bestaudio/best',
+            '--merge-output-format', 'mp4',
+            '--newline',
+            '--progress-template', 'PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.status)s',
+            '-o', outputFile,
+            youtubeUrl
+        ];
+
+        const child = spawn('yt-dlp', args, { shell: process.platform === 'win32' });
+        let stderrTail = '';
+        let activeBar = false;
+
+        const handleLine = (line) => {
+            if (!line) return;
+            if (line.startsWith('PROGRESS|')) {
+                const parts = line.split('|');
+                const percentStr = (parts[1] || '').trim();
+                const speedStr = (parts[2] || '').trim();
+                const etaStr = (parts[3] || '').trim();
+                const percent = parseFloat(percentStr.replace('%', ''));
+                if (!isNaN(percent)) {
+                    renderProgressBar('Downloading', percent, speedStr || 'N/A', etaStr || '--:--');
+                    activeBar = true;
+                }
+            } else if (line.includes('[Merger]')) {
+                if (activeBar) { endProgressLine(); activeBar = false; }
+                console.log('Merging audio and video...');
+            } else if (line.includes('[ExtractAudio]') || line.includes('[FixupM4a]')) {
+                if (activeBar) { endProgressLine(); activeBar = false; }
+                console.log('Post-processing...');
+            }
+        };
+
+        const consume = (buf, isErr) => {
+            const text = buf.toString();
+            if (isErr) stderrTail = (stderrTail + text).slice(-2000);
+            const lines = text.split(/\r?\n/);
+            for (const l of lines) handleLine(l);
+        };
+
+        child.stdout.on('data', (d) => consume(d, false));
+        child.stderr.on('data', (d) => consume(d, true));
+
+        child.on('close', (code) => {
+            if (activeBar) endProgressLine();
+            if (code === 0) resolve();
+            else reject(new Error(`yt-dlp exited with code ${code}. ${stderrTail.trim().split('\n').slice(-3).join(' | ')}`));
+        });
+
+        child.on('error', reject);
+    });
+}
+
+function uploadToBunny(guid, filePath) {
+    return new Promise((resolve, reject) => {
+        const fileSize = fs.statSync(filePath).size;
+        let uploadedBytes = 0;
+        let lastTime = Date.now();
+        let lastLoaded = 0;
+        let lastSpeed = 0;
+        let activeBar = false;
+
+        const fileStream = fs.createReadStream(filePath);
+
+        fileStream.on('data', (chunk) => {
+            uploadedBytes += chunk.length;
+            const now = Date.now();
+            const dt = (now - lastTime) / 1000;
+            if (dt >= 0.3 || uploadedBytes === fileSize) {
+                lastSpeed = (uploadedBytes - lastLoaded) / Math.max(dt, 0.001);
+                const percent = (uploadedBytes / fileSize) * 100;
+                const remaining = lastSpeed > 0 ? (fileSize - uploadedBytes) / lastSpeed : Infinity;
+                renderProgressBar('Uploading  ', percent, formatSpeed(lastSpeed), formatEta(remaining));
+                activeBar = true;
+                lastTime = now;
+                lastLoaded = uploadedBytes;
+            }
+        });
+
+        axios.put(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos/${guid}`, fileStream, {
+            headers: { 'AccessKey': BUNNY_API_KEY, 'Content-Type': 'application/octet-stream' },
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
+        })
+            .then(() => {
+                if (activeBar) endProgressLine();
+                resolve();
+            })
+            .catch((err) => {
+                if (activeBar) endProgressLine();
+                reject(err);
+            });
+    });
+}
+
 async function processVideo(videoObj) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
     try {
-        console.log(`\n--- מעבד: ${videoObj.lessonTitle} ---`);
+        console.log(`\n--- Processing: ${videoObj.lessonTitle} ---`);
 
-        // 1. הורדה מיוטיוב באיכות המקסימלית (1080p) והמרה ל-MP4
-        // אנחנו עושים זאת קודם כדי לא ליצור רשומות ריקות בבאני אם ההורדה נכשלת (למשל עוגיות שפגו)
-        console.log(`📥 מוריד מיוטיוב באיכות מקסימלית...`);
-        execSync(`yt-dlp --extractor-args "youtube:player_client=web_embedded" --js-runtimes node -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
+        console.log('Downloading from YouTube at maximum quality...');
+        await downloadFromYoutube(videoObj.youtubeUrl, tmpFile);
 
-        // 2. קבלת Collection ID לפי התת-קטגוריה
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
 
-        // 3. בניית מערך MetaTags מכל שאר הנתונים באובייקט
         const metaTags = Object.keys(videoObj).map(key => ({
             property: key,
             value: String(videoObj[key])
         }));
 
-        // 4. יצירת רשומה בבאני עם הכותרת החדשה, הקולקשן והמטא-דאטה
-        console.log(`🔑 יוצר רשומת וידאו...`);
+        console.log('Creating video record...');
         const createRes = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`,
             {
                 title: videoObj.lessonTitle,
-                collectionId: collectionId || "",
+                collectionId: collectionId || '',
                 metaTags: metaTags
             },
             { headers }
         );
         const guid = createRes.data.guid;
 
-        // 5. העלאה לבאני
-        console.log(`⬆️ מעלה ל-Bunny...`);
-        const fileStream = fs.createReadStream(tmpFile);
-        await axios.put(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos/${guid}`, fileStream, {
-            headers: { 'AccessKey': BUNNY_API_KEY, 'Content-Type': 'application/octet-stream' },
-            maxContentLength: Infinity, maxBodyLength: Infinity
-        });
+        console.log('Uploading to Bunny...');
+        await uploadToBunny(guid, tmpFile);
 
-        // 6. עדכון האובייקט - שומר על המבנה הקיים ורק מחליף את הערך של ה-URL
         const bunnyStreamUrl = `https://iframe.mediadelivery.net/play/${BUNNY_LIBRARY_ID}/${guid}`;
         videoObj.youtubeUrl = bunnyStreamUrl;
 
-        console.log(`✅ הושלם: ${videoObj.lessonTitle}`);
+        console.log(`Done: ${videoObj.lessonTitle}`);
         return { success: true, videoObj };
 
     } catch (e) {
-        console.error(`❌ נכשל בוידאו ${videoObj.lessonTitle}:`, e.message);
+        console.error(`Failed on video ${videoObj.lessonTitle}:`, e.message);
         return { success: false, videoObj };
     } finally {
         if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
     }
 }
 
-/**
- * הפונקציה הראשית שקוראת וכותבת את הקובץ
- */
 async function run() {
-    // טעינת הקובץ המקומי
     const filePath = path.join(__dirname, 'playlist.json');
     if (!fs.existsSync(filePath)) {
-        return console.error("❌ לא נמצא קובץ playlist.json");
+        return console.error('playlist.json not found');
     }
 
     const playlistData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    console.log(`נמצאו ${playlistData.length} סרטונים בקובץ.`);
+    console.log(`Found ${playlistData.length} videos in the file.`);
 
-    await loadCollections(); // טעינה ראשונית של כל הקולקשנים הקיימים בבאני
+    await loadCollections();
 
     let updatedPlaylist = [];
 
-    // מעבר סדרתי
     for (let i = 0; i < playlistData.length; i++) {
         const video = playlistData[i];
 
-        // בודק אם ה-URL הנוכחי הוא כבר של באני כדי לדלג עליו
         if (video.youtubeUrl && video.youtubeUrl.includes('mediadelivery.net')) {
-            console.log(`⏭️ מדלג, כבר עבר ל-Bunny: ${video.lessonTitle}`);
+            console.log(`Skipping, already on Bunny: ${video.lessonTitle}`);
             updatedPlaylist.push(video);
             continue;
         }
@@ -137,17 +249,15 @@ async function run() {
         updatedPlaylist.push(result.videoObj);
 
         if (!result.success) {
-            console.log("🚨 זוהתה שגיאה קריטית (כנראה חסימת עוגיות מיוטיוב) - עוצר הורדות נוספות ועובר לשמירת הקובץ.");
-            // נוסיף את שאר הסרטונים שנשארו ללא שינוי
+            console.log('Critical error detected (likely YouTube cookie block) - stopping further downloads and saving file.');
             const remaining = playlistData.slice(i + 1);
             updatedPlaylist.push(...remaining);
             break;
         }
     }
 
-    // שמירת ה-JSON המעודכן בחזרה לקובץ
     fs.writeFileSync(filePath, JSON.stringify(updatedPlaylist, null, 2));
-    console.log('\n✨ הסנכרון הסתיים והקובץ המעודכן נשמר בהצלחה!');
+    console.log('\nSync complete and updated file saved successfully!');
 }
 
 run();
