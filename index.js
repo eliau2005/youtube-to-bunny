@@ -49,37 +49,38 @@ async function getOrCreateCollection(name) {
 }
 
 /**
- * העלאת הוידאו ועדכון מטא-דאטה
+ * הורדה מיוטיוב, העלאה לבאני ועדכון מטא-דאטה
  */
 async function processVideo(videoObj) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
     try {
         console.log(`\n--- מעבד: ${videoObj.lessonTitle} ---`);
         
-        // 1. קבלת Collection ID לפי התת-קטגוריה
+        // 1. הורדה מיוטיוב באיכות המקסימלית (1080p) והמרה ל-MP4
+        // אנחנו עושים זאת קודם כדי לא ליצור רשומות ריקות בבאני אם ההורדה נכשלת (למשל עוגיות שפגו)
+        console.log(`📥 מוריד מיוטיוב באיכות מקסימלית...`);
+        execSync(`yt-dlp --cookies cookies.txt --js-runtimes node -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
+
+        // 2. קבלת Collection ID לפי התת-קטגוריה
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
 
-        // 2. בניית מערך MetaTags מכל שאר הנתונים באובייקט
+        // 3. בניית מערך MetaTags מכל שאר הנתונים באובייקט
         const metaTags = Object.keys(videoObj).map(key => ({
             property: key,
             value: String(videoObj[key])
         }));
 
-        // 3. יצירת רשומה בבאני עם הכותרת החדשה, הקולקשן והמטא-דאטה
+        // 4. יצירת רשומה בבאני עם הכותרת החדשה, הקולקשן והמטא-דאטה
         console.log(`🔑 יוצר רשומת וידאו...`);
         const createRes = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`, 
             { 
-                title: videoObj.lessonTitle, // שימוש בכותרת החדשה (lessonTitle)
+                title: videoObj.lessonTitle, 
                 collectionId: collectionId || "",
                 metaTags: metaTags
             }, 
             { headers }
         );
         const guid = createRes.data.guid;
-
-        // 4. הורדה מיוטיוב באיכות המקסימלית (1080p) והמרה ל-MP4
-        console.log(`📥 מוריד מיוטיוב באיכות מקסימלית...`);
-        execSync(`yt-dlp --cookies cookies.txt --js-runtimes node -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${tmpFile}" "${videoObj.youtubeUrl}"`);
 
         // 5. העלאה לבאני
         console.log(`⬆️ מעלה ל-Bunny...`);
@@ -94,11 +95,11 @@ async function processVideo(videoObj) {
         videoObj.youtubeUrl = bunnyStreamUrl; 
 
         console.log(`✅ הושלם: ${videoObj.lessonTitle}`);
-        return videoObj;
+        return { success: true, videoObj };
 
     } catch (e) {
         console.error(`❌ נכשל בוידאו ${videoObj.lessonTitle}:`, e.message);
-        return videoObj; // נחזיר את האובייקט המקורי כדי שלא יעלם מה-JSON במקרה של שגיאה
+        return { success: false, videoObj };
     } finally {
         if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
     }
@@ -122,7 +123,9 @@ async function run() {
     let updatedPlaylist = [];
 
     // מעבר סדרתי
-    for (const video of playlistData) {
+    for (let i = 0; i < playlistData.length; i++) {
+        const video = playlistData[i];
+
         // בודק אם ה-URL הנוכחי הוא כבר של באני כדי לדלג עליו
         if (video.youtubeUrl && video.youtubeUrl.includes('mediadelivery.net')) {
             console.log(`⏭️ מדלג, כבר עבר ל-Bunny: ${video.lessonTitle}`);
@@ -130,8 +133,16 @@ async function run() {
             continue;
         }
         
-        const updatedVideo = await processVideo(video);
-        updatedPlaylist.push(updatedVideo);
+        const result = await processVideo(video);
+        updatedPlaylist.push(result.videoObj);
+
+        if (!result.success) {
+            console.log("🚨 זוהתה שגיאה קריטית (כנראה חסימת עוגיות מיוטיוב) - עוצר הורדות נוספות ועובר לשמירת הקובץ.");
+            // נוסיף את שאר הסרטונים שנשארו ללא שינוי
+            const remaining = playlistData.slice(i + 1);
+            updatedPlaylist.push(...remaining);
+            break; 
+        }
     }
 
     // שמירת ה-JSON המעודכן בחזרה לקובץ
