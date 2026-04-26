@@ -103,14 +103,15 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
 
         const handleLine = (line) => {
             if (!line) return;
-            if (line.startsWith('PROGRESS|')) {
-                const parts = line.split('|');
-                const percentStr = (parts[1] || '').trim();
-                const speedStr = (parts[2] || '').trim();
-                const etaStr = (parts[3] || '').trim();
-                const percent = parseFloat(percentStr.replace('%', ''));
-                if (!isNaN(percent)) {
-                    renderProgressBar('Downloading', percent, speedStr || 'N/A', etaStr || '--:--');
+            if (line.startsWith('[#')) {
+                const pctMatch = line.match(/\((\d+(?:\.\d+)?)%\)/);
+                if (pctMatch) {
+                    const dlMatch = line.match(/DL:(\S+?)(?=[\s\]])/);
+                    const etaMatch = line.match(/ETA:(\S+?)(?=[\s\]])/);
+                    const percent = parseFloat(pctMatch[1]);
+                    const speed = dlMatch ? dlMatch[1] + '/s' : 'N/A';
+                    const eta = etaMatch ? etaMatch[1] : '--:--';
+                    renderProgressBar('Downloading', percent, speed, eta);
                     activeBar = true;
                 }
             } else if (line.includes('[Merger]')) {
@@ -125,7 +126,7 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
         const consume = (buf, isErr) => {
             const text = buf.toString();
             if (isErr) stderrTail = (stderrTail + text).slice(-2000);
-            const lines = text.split(/\r?\n/);
+            const lines = text.split(/\r\n|\r|\n/);
             for (const l of lines) handleLine(l);
         };
 
