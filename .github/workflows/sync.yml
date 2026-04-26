@@ -24,11 +24,6 @@ jobs:
           sudo apt-get install -y ffmpeg
           npm install axios
 
-      - name: Create Cookies File
-        env:
-          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
-        run: echo "$YOUTUBE_COOKIES" > cookies.txt
-
       - name: Run Processing Script
         env:
           BUNNY_LIBRARY_ID: ${{ secrets.BUNNY_LIBRARY_ID }}
