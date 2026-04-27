@@ -119,7 +119,7 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
     return new Promise((resolve, reject) => {
         const args = [
             '--downloader', 'aria2c',
-            '--downloader-args', 'aria2c:-x 8 -s 8 -j 8 -k 5M --console-log-level=info --summary-interval=1',
+            '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
             '--sleep-requests', '2',
             '--extractor-args', 'youtube:player_client=web,web_embedded',
             '--js-runtimes', 'node',
