@@ -255,29 +255,26 @@ async function run() {
 
     await loadCollections();
 
-    let updatedPlaylist = [];
-
     for (let i = 0; i < playlistData.length; i++) {
         const video = playlistData[i];
 
         if (video.youtubeUrl && video.youtubeUrl.includes('mediadelivery.net')) {
             console.log(`Skipping, already on Bunny: ${video.lessonTitle}`);
-            updatedPlaylist.push(video);
             continue;
         }
 
         const result = await processVideo(video);
-        updatedPlaylist.push(result.videoObj);
 
-        if (!result.success) {
+        if (result.success) {
+            // Save progress after each success
+            fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
+        } else {
             console.log('Critical error detected (likely YouTube cookie block) - stopping further downloads and saving file.');
-            const remaining = playlistData.slice(i + 1);
-            updatedPlaylist.push(...remaining);
             break;
         }
     }
 
-    fs.writeFileSync(filePath, JSON.stringify(updatedPlaylist, null, 2));
+    fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
     console.log('\nSync complete and updated file saved successfully!');
 }
 
