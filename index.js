@@ -88,7 +88,8 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
     return new Promise((resolve, reject) => {
         const args = [
             '--downloader', 'aria2c',
-            '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 1M --console-log-level=info --summary-interval=1',
+            '--downloader-args', 'aria2c:-x 4 -s 4 -j 4 -k 5M --console-log-level=info --summary-interval=1',
+            '--sleep-requests', '2',
             '--extractor-args', 'youtube:player_client=web,web_embedded',
             '--js-runtimes', 'node',
             '-f', 'bestvideo[height=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
@@ -268,6 +269,11 @@ async function run() {
         if (result.success) {
             // Save progress after each success
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
+
+            if (i < playlistData.length - 1) {
+                console.log("⏳ waiting 2.5 min to not block...");
+                await new Promise(resolve => setTimeout(resolve, 150000));
+            }
         } else {
             console.log('Critical error detected (likely YouTube cookie block) - stopping further downloads and saving file.');
             break;
