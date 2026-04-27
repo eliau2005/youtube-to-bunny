@@ -52,6 +52,36 @@ function endProgressLine() {
     if (process.stdout.isTTY) process.stdout.write('\n');
 }
 
+function sleepWithCountdown(totalSeconds, completed, total) {
+    return new Promise((resolve) => {
+        let remaining = totalSeconds;
+        const render = () => {
+            const m = Math.floor(remaining / 60);
+            const s = remaining % 60;
+            const timeStr = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+            const line = `⏳ Next download in ${timeStr} | ${completed}/${total} videos completed`;
+            if (process.stdout.isTTY) {
+                readline.clearLine(process.stdout, 0);
+                readline.cursorTo(process.stdout, 0);
+                process.stdout.write(line);
+            } else {
+                process.stdout.write(line + '\n');
+            }
+        };
+        render();
+        const interval = setInterval(() => {
+            remaining--;
+            if (remaining <= 0) {
+                clearInterval(interval);
+                if (process.stdout.isTTY) process.stdout.write('\n');
+                resolve();
+            } else {
+                render();
+            }
+        }, 1000);
+    });
+}
+
 async function loadCollections() {
     try {
         const res = await axios.get(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/collections?itemsPerPage=100`, { headers });
@@ -253,7 +283,9 @@ async function run() {
     }
 
     const playlistData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    console.log(`Found ${playlistData.length} videos in the file.`);
+    const total = playlistData.length;
+    let completed = playlistData.filter(v => v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')).length;
+    console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
 
     await loadCollections();
 
@@ -268,12 +300,14 @@ async function run() {
         const result = await processVideo(video);
 
         if (result.success) {
+            completed++;
+            console.log(`Progress: ${completed}/${total} videos completed.`);
             // Save progress after each success
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
 
-            if (i < playlistData.length - 1) {
-                console.log("⏳ waiting 2.5 min to not block...");
-                await new Promise(resolve => setTimeout(resolve, 150000));
+            const hasMore = playlistData.slice(i + 1).some(v => !(v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')));
+            if (hasMore) {
+                await sleepWithCountdown(60, completed, total);
             }
         } else {
             console.log('Critical error detected (likely YouTube cookie block) - stopping further downloads and saving file.');
