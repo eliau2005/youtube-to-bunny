@@ -1,3 +1,4 @@
+require('dotenv').config();
 const axios = require('axios');
 const { spawn } = require('child_process');
 const fs = require('fs');
