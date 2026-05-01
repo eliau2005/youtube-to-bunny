@@ -4,6 +4,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const https = require('https');
 
 const { BUNNY_LIBRARY_ID, BUNNY_API_KEY } = process.env;
 
@@ -11,6 +12,26 @@ const headers = {
     'AccessKey': BUNNY_API_KEY,
     'Content-Type': 'application/json'
 };
+
+const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = process.env;
+
+// ─── Telegram Notification ───────────────────────────────────────────────────
+function sendTelegram(message) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return Promise.resolve();
+    return new Promise((resolve) => {
+        const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'Markdown' });
+        const req = https.request({
+            hostname: 'api.telegram.org',
+            path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+        }, (res) => { res.resume(); resolve(); });
+        req.on('error', (e) => { console.warn('Telegram notification failed:', e.message); resolve(); });
+        req.write(body);
+        req.end();
+    });
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 let collectionsMap = {};
 
@@ -359,6 +380,11 @@ async function run() {
 
     fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
     console.log('\nSync complete and updated file saved successfully!');
+    await sendTelegram(`✅ *youtube-to-bunny הסתיים!*\n${completed}/${total} סרטונים הועלו בהצלחה.`);
 }
 
-run();
+run().catch(async (err) => {
+    console.error('Fatal error:', err.message);
+    await sendTelegram(`🚨 *youtube-to-bunny קרסה!*\n\`${err.message}\``);
+    process.exit(1);
+});
