@@ -121,7 +121,7 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
             '--downloader', 'aria2c',
             '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
             '--sleep-requests', '2',
-            '--extractor-args', 'youtube:player_client=web,web_embedded',
+            '--extractor-args', 'youtube:player_client=android',
             '--js-runtimes', 'node',
             '-f', 'bestvideo[height=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
             '--merge-output-format', 'mp4',
