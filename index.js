@@ -372,9 +372,11 @@ async function run() {
                 await sleepWithCountdown(60, completed, total);
             }
         } else {
-            console.log(`Skipping failed video and continuing with the rest...`);
-            // Save progress even on failure so we don't lose completed videos
+            // Save progress so we don't lose completed videos
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
+            const failedTitle = video.lessonTitle || video.videoId || 'לא ידוע';
+            await sendTelegram(`❌ *youtube-to-bunny נעצרה!*\nהסרטון "${failedTitle}" נכשל.\n_הושלמו ${completed}/${total} לפני הכישלון._`);
+            throw new Error(`Video failed: ${failedTitle}`);
         }
     }
 
