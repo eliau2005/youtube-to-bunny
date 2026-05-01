@@ -15,22 +15,58 @@ const headers = {
 
 const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = process.env;
 
-// ─── Telegram Notification ───────────────────────────────────────────────────
-function sendTelegram(message) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return Promise.resolve();
+// ─── Telegram Helpers ────────────────────────────────────────────────────────
+
+// Sends a new message; resolves with the Telegram Message object (contains .message_id) or null
+function sendTelegramMessage(text) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return Promise.resolve(null);
     return new Promise((resolve) => {
-        const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'Markdown' });
+        const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' });
         const req = https.request({
             hostname: 'api.telegram.org',
             path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-        }, (res) => { res.resume(); resolve(); });
-        req.on('error', (e) => { console.warn('Telegram notification failed:', e.message); resolve(); });
+        }, (res) => {
+            let data = '';
+            res.on('data', d => data += d.toString());
+            res.on('end', () => {
+                try { resolve(JSON.parse(data).result || null); }
+                catch { resolve(null); }
+            });
+        });
+        req.on('error', (e) => { console.warn('Telegram send failed:', e.message); resolve(null); });
         req.write(body);
         req.end();
     });
 }
+
+// Edits an existing message in-place
+function editTelegramMessage(messageId, text) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !messageId) return Promise.resolve();
+    return new Promise((resolve) => {
+        const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, message_id: messageId, text, parse_mode: 'Markdown' });
+        const req = https.request({
+            hostname: 'api.telegram.org',
+            path: `/bot${TELEGRAM_BOT_TOKEN}/editMessageText`,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+        }, (res) => { res.resume(); resolve(); });
+        req.on('error', () => resolve());
+        req.write(body);
+        req.end();
+    });
+}
+
+// Fire-and-forget wrapper (used for one-off alerts)
+function sendTelegram(message) { return sendTelegramMessage(message).then(() => {}); }
+
+// 20-char ASCII progress bar for Telegram messages
+function telegramBar(percent) {
+    const filled = Math.min(20, Math.round(percent / 5));
+    return '█'.repeat(filled) + '░'.repeat(20 - filled);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 let collectionsMap = {};
@@ -177,7 +213,7 @@ function listFormats(youtubeUrl, cookieArgs) {
     });
 }
 
-function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs) {
+function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs, onProgress) {
     return new Promise((resolve, reject) => {
         const args = [
             ...cookieArgs,
@@ -211,6 +247,7 @@ function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs) {
                 if (!isNaN(percent)) {
                     renderProgressBar('Downloading', percent, speedStr || 'N/A', etaStr || '--:--');
                     activeBar = true;
+                    if (onProgress) onProgress(percent, speedStr || 'N/A', etaStr || '--:--');
                 }
             } else if (line.startsWith('[#')) {
                 const pctMatch = line.match(/\((\d+(?:\.\d+)?)%\)/);
@@ -222,6 +259,7 @@ function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs) {
                     const eta = etaMatch ? etaMatch[1] : '--:--';
                     renderProgressBar('Downloading', percent, speed, eta);
                     activeBar = true;
+                    if (onProgress) onProgress(percent, speed, eta);
                 }
             } else if (line.includes('[Merger]')) {
                 if (activeBar) { endProgressLine(); activeBar = false; }
@@ -252,7 +290,7 @@ function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs) {
     });
 }
 
-function uploadToBunny(guid, filePath) {
+function uploadToBunny(guid, filePath, onProgress) {
     return new Promise((resolve, reject) => {
         const fileSize = fs.statSync(filePath).size;
         let uploadedBytes = 0;
@@ -273,6 +311,7 @@ function uploadToBunny(guid, filePath) {
                 const remaining = lastSpeed > 0 ? (fileSize - uploadedBytes) / lastSpeed : Infinity;
                 renderProgressBar('Uploading  ', percent, formatSpeed(lastSpeed), formatEta(remaining));
                 activeBar = true;
+                if (onProgress) onProgress(percent, formatSpeed(lastSpeed), formatEta(remaining));
                 lastTime = now;
                 lastLoaded = uploadedBytes;
             }
@@ -296,15 +335,56 @@ function uploadToBunny(guid, filePath) {
 
 async function processVideo(videoObj, cookieArgs) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
+    const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
+
+    // ── Live Telegram progress message ──────────────────────────────────────
+    let liveId = null;        // message_id of the pinned progress message
+    let lastEditAt = 0;       // timestamp of last edit
+    const THROTTLE_MS = 10000; // max one edit per 10 seconds
+
+    const initLive = async (text) => {
+        const msg = await sendTelegramMessage(text);
+        liveId = msg?.message_id || null;
+        lastEditAt = Date.now();
+    };
+
+    // Throttled edit — pass force=true to bypass throttle
+    const updateLive = (text, force = false) => {
+        const now = Date.now();
+        if (!liveId || (!force && now - lastEditAt < THROTTLE_MS)) return;
+        lastEditAt = now;
+        return editTelegramMessage(liveId, text);
+    };
+
+    const finalizeLive = (text) => editTelegramMessage(liveId, text);
+    // ────────────────────────────────────────────────────────────────────────
+
     try {
-        console.log(`\n--- Processing: ${videoObj.lessonTitle} ---`);
+        console.log(`\n--- Processing: ${title} ---`);
+        await initLive(`🎬 *מתחיל עיבוד*\n"${title}"\n\n📥 הורדה מ\-YouTube\.\.\.`);
 
         console.log('Downloading from YouTube at maximum quality...');
         const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
         if (maxRes > 0 && maxRes < 720) {
             console.warn(`⚠️  WARNING: YouTube is only offering ${maxRes}p - cookies may be expired or invalid!`);
         }
-        await downloadFromYoutube(videoObj.youtubeUrl, tmpFile, cookieArgs);
+
+        await downloadFromYoutube(videoObj.youtubeUrl, tmpFile, cookieArgs, (pct, speed, eta) => {
+            updateLive(
+                `🎬 *${title}*\n\n` +
+                `📥 *הורדה:* ${pct.toFixed(1)}%\n` +
+                `\`${telegramBar(pct)}\`\n` +
+                `⚡ ${speed} | ETA ${eta}`
+            );
+        });
+
+        // Force-update to show upload phase started
+        await updateLive(
+            `🎬 *${title}*\n\n` +
+            `📥 הורדה: ✅ הושלמה\n` +
+            `☁️ *מעלה ל\-Bunny\.\.\.*`,
+            true
+        );
 
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
 
@@ -325,20 +405,31 @@ async function processVideo(videoObj, cookieArgs) {
         const guid = createRes.data.guid;
 
         console.log('Uploading to Bunny...');
-        await uploadToBunny(guid, tmpFile);
+        await uploadToBunny(guid, tmpFile, (pct, speed, eta) => {
+            updateLive(
+                `🎬 *${title}*\n\n` +
+                `📥 הורדה: ✅\n` +
+                `☁️ *העלאה:* ${pct.toFixed(1)}%\n` +
+                `\`${telegramBar(pct)}\`\n` +
+                `⚡ ${speed} | ETA ${eta}`
+            );
+        });
 
         const bunnyStreamUrl = `https://iframe.mediadelivery.net/play/${BUNNY_LIBRARY_ID}/${guid}`;
         videoObj.youtubeUrl = bunnyStreamUrl;
 
-        console.log(`Done: ${videoObj.lessonTitle}`);
+        // Final edit: mark as done
+        await finalizeLive(`✅ *הושלם:* "${title}"\n\n📥 הורדה: ✅\n☁️ העלאה: ✅`);
+        console.log(`Done: ${title}`);
         return { success: true, videoObj };
 
     } catch (e) {
-        console.error(`Failed on video ${videoObj.lessonTitle}:`, e.message);
+        console.error(`Failed on video ${title}:`, e.message);
         if (e.response) {
             console.error('  status:', e.response.status);
             console.error('  body:', JSON.stringify(e.response.data));
         }
+        await finalizeLive(`❌ *נכשל:* "${title}"\n\`${e.message.slice(0, 200)}\``);
         return { success: false, videoObj };
     } finally {
         if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
