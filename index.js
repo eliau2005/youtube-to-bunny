@@ -115,6 +115,29 @@ async function getOrCreateCollection(name) {
     }
 }
 
+function listFormats(youtubeUrl, cookieArgs) {
+    return new Promise((resolve) => {
+        const args = [...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node', youtubeUrl];
+        const child = spawn('yt-dlp', args, { shell: process.platform === 'win32' });
+        let output = '';
+        child.stdout.on('data', d => output += d.toString());
+        child.stderr.on('data', d => output += d.toString());
+        child.on('close', () => {
+            // Extract the highest resolution available
+            const resolutions = [...output.matchAll(/(\d{3,4})p/g)].map(m => parseInt(m[1]));
+            const maxRes = resolutions.length ? Math.max(...resolutions) : 0;
+            console.log(`Available formats (max resolution found: ${maxRes}p):`);
+            // Print only the resolution table lines
+            const lines = output.split('\n').filter(l =>
+                l.match(/^\d+\s/) || l.includes('ID') || l.includes('---')
+            );
+            lines.slice(0, 30).forEach(l => console.log(' ', l));
+            resolve(maxRes);
+        });
+        child.on('error', () => resolve(0));
+    });
+}
+
 function downloadFromYoutube(youtubeUrl, outputFile) {
     return new Promise((resolve, reject) => {
         // Build cookie args: prefer cookies.txt file, fall back to browser cookies
@@ -125,14 +148,15 @@ function downloadFromYoutube(youtubeUrl, outputFile) {
 
         const args = [
             ...cookieArgs,
+            '--no-playlist',
+            '--js-runtimes', 'node',
             '--downloader', 'aria2c',
             '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
             '--sleep-requests', '2',
-            '--extractor-args', 'youtube:player_client=web',
-            '--js-runtimes', 'node',
-            '-f', 'bestvideo+bestaudio/best',
+            '-f', 'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best',
             '-S', 'res:1080,fps,vcodec:h264:vp9,acodec:m4a',
             '--merge-output-format', 'mp4',
+            '--print', 'before_dl:Downloading format: %(format_id)s | %(height)sp | %(vcodec)s',
             '--newline',
             '--progress-template', 'PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.status)s',
             '-o', outputFile,
@@ -243,6 +267,15 @@ async function processVideo(videoObj) {
         console.log(`\n--- Processing: ${videoObj.lessonTitle} ---`);
 
         console.log('Downloading from YouTube at maximum quality...');
+        // First, list available formats so we can diagnose quality issues
+        const cookiesFile = path.join(__dirname, 'cookies.txt');
+        const cookieArgs = fs.existsSync(cookiesFile)
+            ? ['--cookies', cookiesFile]
+            : ['--cookies-from-browser', 'chrome'];
+        const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
+        if (maxRes > 0 && maxRes < 720) {
+            console.warn(`⚠️  WARNING: YouTube is only offering ${maxRes}p - cookies may be expired or invalid!`);
+        }
         await downloadFromYoutube(videoObj.youtubeUrl, tmpFile);
 
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
