@@ -136,6 +136,24 @@ async function getOrCreateCollection(name) {
     }
 }
 
+// ─── Cookie Rotation ──────────────────────────────────────────────────────────
+function getCookieFiles() {
+    // Support cookies1.txt, cookies2.txt, cookies3.txt  (or plain cookies.txt as fallback)
+    const numbered = [1, 2, 3]
+        .map(n => path.join(__dirname, `cookies${n}.txt`))
+        .filter(f => fs.existsSync(f));
+    if (numbered.length > 0) return numbered;
+    const plain = path.join(__dirname, 'cookies.txt');
+    if (fs.existsSync(plain)) return [plain];
+    return []; // will fall back to --cookies-from-browser chrome
+}
+
+function buildCookieArgs(cookieFile) {
+    if (!cookieFile) return ['--cookies-from-browser', 'chrome'];
+    return ['--cookies', cookieFile];
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 function listFormats(youtubeUrl, cookieArgs) {
     return new Promise((resolve) => {
         const args = [...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node', youtubeUrl];
@@ -152,21 +170,15 @@ function listFormats(youtubeUrl, cookieArgs) {
             const lines = output.split('\n').filter(l =>
                 l.match(/^\d+\s/) || l.includes('ID') || l.includes('---')
             );
-            lines.slice(0, 30).forEach(l => console.log(' ', l));
+            lines.slice(0, 30).forEach(l => console.log('  ', l));
             resolve(maxRes);
         });
         child.on('error', () => resolve(0));
     });
 }
 
-function downloadFromYoutube(youtubeUrl, outputFile) {
+function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs) {
     return new Promise((resolve, reject) => {
-        // Build cookie args: prefer cookies.txt file, fall back to browser cookies
-        const cookiesFile = path.join(__dirname, 'cookies.txt');
-        const cookieArgs = fs.existsSync(cookiesFile)
-            ? ['--cookies', cookiesFile]
-            : ['--cookies-from-browser', 'chrome'];
-
         const args = [
             ...cookieArgs,
             '--no-playlist',
@@ -282,22 +294,17 @@ function uploadToBunny(guid, filePath) {
     });
 }
 
-async function processVideo(videoObj) {
+async function processVideo(videoObj, cookieArgs) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
     try {
         console.log(`\n--- Processing: ${videoObj.lessonTitle} ---`);
 
         console.log('Downloading from YouTube at maximum quality...');
-        // First, list available formats so we can diagnose quality issues
-        const cookiesFile = path.join(__dirname, 'cookies.txt');
-        const cookieArgs = fs.existsSync(cookiesFile)
-            ? ['--cookies', cookiesFile]
-            : ['--cookies-from-browser', 'chrome'];
         const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
         if (maxRes > 0 && maxRes < 720) {
             console.warn(`⚠️  WARNING: YouTube is only offering ${maxRes}p - cookies may be expired or invalid!`);
         }
-        await downloadFromYoutube(videoObj.youtubeUrl, tmpFile);
+        await downloadFromYoutube(videoObj.youtubeUrl, tmpFile, cookieArgs);
 
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
 
@@ -349,6 +356,18 @@ async function run() {
     let completed = playlistData.filter(v => v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')).length;
     console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
 
+    // ── Cookie rotation setup ────────────────────────────────────────────────
+    const cookieFiles = getCookieFiles();
+    let cookieIndex = 0;
+    const activeCookieFile = () => cookieFiles[cookieIndex] || null;
+    if (cookieFiles.length > 0) {
+        console.log(`Found ${cookieFiles.length} cookie file(s): ${cookieFiles.map(f => path.basename(f)).join(', ')}`);
+        console.log(`Starting with: ${path.basename(cookieFiles[0])}`);
+    } else {
+        console.log('No cookie files found — will use browser cookies.');
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     await loadCollections();
 
     for (let i = 0; i < playlistData.length; i++) {
@@ -359,7 +378,24 @@ async function run() {
             continue;
         }
 
-        const result = await processVideo(video);
+        // Try with current cookie file; on failure, rotate through remaining ones
+        let result = await processVideo(video, buildCookieArgs(activeCookieFile()));
+
+        if (!result.success && cookieFiles.length > 1) {
+            // Try remaining cookie files before giving up
+            for (let attempt = 1; attempt < cookieFiles.length; attempt++) {
+                cookieIndex = (cookieIndex + 1) % cookieFiles.length;
+                const nextFile = path.basename(cookieFiles[cookieIndex]);
+                console.log(`\n🔄 Switching to ${nextFile} and retrying...`);
+                await sendTelegram(
+                    `🔄 *Cookie הוחלף ל-${nextFile}*\nהסרטון "${video.lessonTitle || video.videoId}" נכשל — מנסה שוב עם קובץ cookies אחר.`
+                );
+                // Short pause before retry
+                await sleepWithCountdown(30, completed, total);
+                result = await processVideo(video, buildCookieArgs(activeCookieFile()));
+                if (result.success) break;
+            }
+        }
 
         if (result.success) {
             completed++;
@@ -369,14 +405,19 @@ async function run() {
 
             const hasMore = playlistData.slice(i + 1).some(v => !(v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')));
             if (hasMore) {
-                await sleepWithCountdown(60, completed, total);
+                // Random delay 2–5 minutes to avoid bot detection
+                const delaySeconds = Math.floor(Math.random() * (300 - 120 + 1)) + 120;
+                console.log(`\n⏱️  Waiting ${Math.round(delaySeconds / 60 * 10) / 10} min before next download...`);
+                await sleepWithCountdown(delaySeconds, completed, total);
             }
         } else {
-            // Save progress so we don't lose completed videos
+            // All cookie files exhausted — stop entirely
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
             const failedTitle = video.lessonTitle || video.videoId || 'לא ידוע';
-            await sendTelegram(`❌ *youtube-to-bunny נעצרה!*\nהסרטון "${failedTitle}" נכשל.\n_הושלמו ${completed}/${total} לפני הכישלון._`);
-            throw new Error(`Video failed: ${failedTitle}`);
+            await sendTelegram(
+                `❌ *youtube-to-bunny נעצרה!*\nהסרטון "${failedTitle}" נכשל עם כל קבצי ה-cookies.\n_הושלמו ${completed}/${total} לפני הכישלון._`
+            );
+            throw new Error(`Video failed on all cookie files: ${failedTitle}`);
         }
     }
 
