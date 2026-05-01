@@ -117,11 +117,18 @@ async function getOrCreateCollection(name) {
 
 function downloadFromYoutube(youtubeUrl, outputFile) {
     return new Promise((resolve, reject) => {
+        // Build cookie args: prefer cookies.txt file, fall back to browser cookies
+        const cookiesFile = path.join(__dirname, 'cookies.txt');
+        const cookieArgs = fs.existsSync(cookiesFile)
+            ? ['--cookies', cookiesFile]
+            : ['--cookies-from-browser', 'chrome'];
+
         const args = [
+            ...cookieArgs,
             '--downloader', 'aria2c',
             '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
             '--sleep-requests', '2',
-            '--extractor-args', 'youtube:player_client=android',
+            '--extractor-args', 'youtube:player_client=web',
             '--js-runtimes', 'node',
             '-f', 'bestvideo[height=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
             '--merge-output-format', 'mp4',
@@ -310,8 +317,9 @@ async function run() {
                 await sleepWithCountdown(60, completed, total);
             }
         } else {
-            console.log('Critical error detected (likely YouTube cookie block) - stopping further downloads and saving file.');
-            break;
+            console.log(`Skipping failed video and continuing with the rest...`);
+            // Save progress even on failure so we don't lose completed videos
+            fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
         }
     }
 
