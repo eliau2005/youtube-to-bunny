@@ -41,9 +41,16 @@ function sendTelegramMessage(text) {
     });
 }
 
+// Adaptive backoff state shared by editTelegramMessage. When Telegram returns
+// 429 with retry_after=N, all edits are skipped client-side until that window
+// elapses — saves wasted HTTP requests and keeps the console clean.
+let tgBackoffUntil = 0;
+let tgBackoffWarned = false;
+
 // Edits an existing message in-place; handles Telegram 429 rate-limit gracefully
 function editTelegramMessage(messageId, text) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !messageId) return Promise.resolve();
+    if (Date.now() < tgBackoffUntil) return Promise.resolve(); // in backoff — skip silently
     return new Promise((resolve) => {
         const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, message_id: messageId, text, parse_mode: 'Markdown' });
         const req = https.request({
@@ -56,11 +63,18 @@ function editTelegramMessage(messageId, text) {
             res.on('data', d => data += d.toString());
             res.on('end', () => {
                 if (res.statusCode === 429) {
-                    // Rate limited — parse retry-after if available and skip silently
                     try {
                         const parsed = JSON.parse(data);
                         const wait = parsed?.parameters?.retry_after || 1;
-                        console.warn(`Telegram rate-limited, retry after ${wait}s (skipping this update)`);
+                        // Add a 5-sec safety buffer on top of Telegram's retry_after
+                        // so we don't bump back into the limit and earn longer bans.
+                        const totalWait = wait + 5;
+                        tgBackoffUntil = Date.now() + totalWait * 1000;
+                        if (!tgBackoffWarned) {
+                            tgBackoffWarned = true;
+                            process.stderr.write(`\nTelegram rate-limited — Telegram asked ${wait}s, backing off ${totalWait}s (+5s buffer)\n`);
+                            setTimeout(() => { tgBackoffWarned = false; }, totalWait * 1000 + 100);
+                        }
                     } catch {}
                 }
                 resolve();
