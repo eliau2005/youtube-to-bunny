@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const https = require('https');
+const { fetchAndWriteProxies } = require('./fetch-free-proxies');
 
 const { BUNNY_LIBRARY_ID, BUNNY_API_KEY } = process.env;
 
@@ -607,6 +608,27 @@ async function run() {
     const remaining = total - completed;
     console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
 
+    // ── Refresh proxies + load collections in parallel (skip with SKIP_PROXY_FETCH=1) ─
+    const skipFetch = process.env.SKIP_PROXY_FETCH === '1';
+    const proxyFetchPromise = skipFetch
+        ? Promise.resolve({ count: 0, written: false, skipped: true })
+        : (async () => {
+            console.log('\n🌐 Refreshing free proxy pool...');
+            try {
+                return await fetchAndWriteProxies({ limit: 100, timeoutMs: 4000, concurrency: 200 });
+            } catch (e) {
+                console.warn(`Proxy fetch failed: ${e.message} — continuing with existing proxies.txt (if any).`);
+                return { count: 0, written: false, error: e.message };
+            }
+        })();
+    const [, proxyResult] = await Promise.all([loadCollections(), proxyFetchPromise]);
+    if (skipFetch) {
+        console.log('SKIP_PROXY_FETCH=1 → using existing proxies.txt as-is.');
+    } else if (proxyResult.written) {
+        console.log(`Proxy pool refreshed: ${proxyResult.count} working proxies.`);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // ── Auth source rotation setup (proxies → cookies) ───────────────────────
     const sources = getAuthSources();
     let sourceIndex = 0;
@@ -614,11 +636,9 @@ async function run() {
     const proxyCount = sources.filter(s => s.type === 'proxy').length;
     const cookieCount = sources.filter(s => s.type === 'cookie').length;
     console.log(`Auth sources: ${proxyCount} proxy(ies), ${cookieCount} cookie file(s)${proxyCount + cookieCount === 0 ? ' (using browser cookies)' : ''}`);
-    console.log(`Order: ${sources.map(s => `${s.type}:${s.label}`).join(' → ')}`);
+    console.log(`Order: ${sources.slice(0, 5).map(s => `${s.type}:${s.label}`).join(' → ')}${sources.length > 5 ? ` → … (+${sources.length - 5})` : ''}`);
     console.log(`Starting with: ${activeSource().type} ${activeSource().label}`);
     // ────────────────────────────────────────────────────────────────────────
-
-    await loadCollections();
 
     // ── Session stats ────────────────────────────────────────────────────────
     const sessionStart = Date.now();
