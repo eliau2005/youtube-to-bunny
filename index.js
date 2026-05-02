@@ -153,65 +153,6 @@ function endProgressLine() {
     if (process.stdout.isTTY) process.stdout.write('\n');
 }
 
-// totalSeconds: wait duration
-// completed/total: for console label
-// liveId: optional Telegram message_id to update with countdown every 15 sec
-// lastDoneText: the completed-video summary shown above the countdown
-function sleepWithCountdown(totalSeconds, completed, total, liveId = null, lastDoneText = '') {
-    return new Promise((resolve) => {
-        const startedAt = Date.now();
-        const totalMinStr = (totalSeconds / 60).toFixed(1);
-        const TICK_MS = 1000;        // console refresh once a second is plenty
-        const TG_THROTTLE_MS = 10000; // Telegram countdown: every 10 sec
-        let lastTgEdit = 0;
-
-        const fmtTime = (s) => {
-            const m = Math.floor(s / 60);
-            return `${String(m).padStart(2, '0')}:${String(Math.floor(s) % 60).padStart(2, '0')}`;
-        };
-
-        const renderConsole = (remaining) => {
-            const line = `⏳ Next download in ${fmtTime(remaining)} (random ${totalMinStr}m) | ${completed}/${total} videos completed`;
-            if (process.stdout.isTTY) {
-                readline.clearLine(process.stdout, 0);
-                readline.cursorTo(process.stdout, 0);
-                process.stdout.write(line);
-            } else {
-                process.stdout.write(line + '\n');
-            }
-        };
-
-        const renderTelegram = (remaining) => {
-            if (!liveId) return;
-            const now = Date.now();
-            if (now - lastTgEdit < TG_THROTTLE_MS) return;
-            lastTgEdit = now;
-            const text =
-                (lastDoneText ? lastDoneText + '\n\n' : '') +
-                `⏳ *הורדה הבאה עוד:* ${fmtTime(remaining)}\n` +
-                `🎲 השהיה אקראית של ${totalMinStr} דק׳ (אנטי-בוט)\n` +
-                `📊 הושלמו ${completed}/${total} סרטונים`;
-            editTelegramMessage(liveId, text); // fire-and-forget
-        };
-
-        renderConsole(totalSeconds);
-        renderTelegram(totalSeconds); // immediate first update
-
-        const interval = setInterval(() => {
-            const elapsed = (Date.now() - startedAt) / 1000;
-            const remaining = totalSeconds - elapsed;
-            if (remaining <= 0) {
-                clearInterval(interval);
-                if (process.stdout.isTTY) process.stdout.write('\n');
-                resolve();
-            } else {
-                renderConsole(remaining);
-                renderTelegram(remaining);
-            }
-        }, TICK_MS);
-    });
-}
-
 async function loadCollections() {
     try {
         const res = await axios.get(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/collections?itemsPerPage=100`, { headers });
@@ -478,7 +419,7 @@ async function processVideo(videoObj, cookieArgs, ctx) {
     const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
 
     // Header shown at top of every Telegram message for this video
-    const { videoIndex, total, completed, sourceType, sourceLabel, attempt } = ctx;
+    const { videoIndex, total, completed, sourceType, sourceLabel, attempt, liveId: providedLiveId } = ctx;
     const overallPct = total > 0 ? Math.round((completed / total) * 100) : 0;
     const sourceTag = sourceLabel ? ` | ${sourceEmoji(sourceType)} ${sourceLabel}` : '';
     const attemptLabel = attempt > 1 ? ` (ניסיון ${attempt})` : '';
@@ -488,12 +429,18 @@ async function processVideo(videoObj, cookieArgs, ctx) {
         `🕐 ${nowHHMM()}`;
 
     // ── Live Telegram progress message ─────────────────────────────────────
-    let liveId = null;
+    // If ctx supplies a liveId, reuse it (one message per video, edited across
+    // attempts). Otherwise create a fresh one (legacy/standalone behavior).
+    let liveId = providedLiveId || null;
     let lastEditAt = 0;
     const DL_THROTTLE_MS  = 2000; // download/upload progress: every 2 sec
     const UPL_THROTTLE_MS = 2000;
 
     const initLive = async (text) => {
+        if (liveId) {
+            lastEditAt = Date.now();
+            return editTelegramMessage(liveId, text);
+        }
         const msg = await sendTelegramMessage(text);
         liveId = msg?.message_id || null;
         lastEditAt = Date.now();
@@ -739,6 +686,19 @@ async function run() {
         let result = null;
         let attempt = 0;
 
+        // ONE Telegram message per video — edited throughout (waiting → switching →
+        // download → upload → success/failure). Created here, passed via ctx.liveId
+        // into processVideo so all updates land on the same message.
+        const title = video.lessonTitle || video.videoId || 'Unknown';
+        const overallPct = total > 0 ? Math.round((completed / total) * 100) : 0;
+        const startMsg = await sendTelegramMessage(
+            `🎬 *[${globalIdx + 1}/${total}]* ${title}\n` +
+            `📈 התקדמות: ${completed}/${total} (${overallPct}%)\n` +
+            `🕐 ${nowHHMM()}\n\n` +
+            `⏳ ממתין לפרוקסי זמין...`
+        );
+        const liveId = startMsg?.message_id || null;
+
         const tryWith = async (source) => {
             attempt++;
             if (attempt > 1) {
@@ -747,12 +707,14 @@ async function run() {
                 const waitSec = isProxy ? 5 : 30;
                 const nextHeb = source.type === 'proxy' ? 'Proxy' : source.type === 'cookie' ? 'Cookie' : 'Browser';
                 console.log(`\n🔄 [${globalIdx + 1}] Switching to ${source.type}:${source.label} (attempt ${attempt}) — waiting ${waitSec}s...`);
-                await sendTelegram(
-                    `🔄 *מחליף ל-${nextHeb}: ${source.label}*\n` +
-                    `🎬 [${globalIdx + 1}/${total}] ${video.lessonTitle || video.videoId}\n` +
-                    `🔁 ניסיון ${attempt} — המתנה ${waitSec} שנ׳ ואז ניסיון חוזר.`
-                );
-                await sleepWithCountdown(waitSec, completed, total);
+                if (liveId) {
+                    await editTelegramMessage(liveId,
+                        `🎬 *[${globalIdx + 1}/${total}]* ${title}\n` +
+                        `🔄 *מחליף ל-${nextHeb}: ${source.label}*\n` +
+                        `🔁 ניסיון ${attempt} — המתנה ${waitSec} שנ׳`
+                    );
+                }
+                await new Promise(r => setTimeout(r, waitSec * 1000));
             }
             return await processVideo(video, buildYtdlpAuthArgs(source), {
                 videoIndex: globalIdx + 1,
@@ -760,7 +722,8 @@ async function run() {
                 completed,
                 sourceType: source.type,
                 sourceLabel: source.label,
-                attempt
+                attempt,
+                liveId
             });
         };
 
@@ -792,18 +755,20 @@ async function run() {
         } else if (!stopReason) {
             // All sources exhausted for this video — flag the run to stop;
             // other in-flight workers finish their current video then exit.
+            // Edit the per-video message to the final stop notice (one message per video).
             sessionFailures++;
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
             const failedTitle = video.lessonTitle || video.videoId || 'לא ידוע';
             const sessionDur = formatDuration(Math.round((Date.now() - sessionStart) / 1000));
-            await sendTelegram(
+            const stopText =
                 `❌ *youtube-to-bunny נעצרה!*\n` +
                 `🎬 [${globalIdx + 1}/${total}] ${failedTitle}\n` +
                 `🔁 נכשל על כל הפרוקסיים שנוסו + ${cookieList.length} fallback(s)\n` +
                 `📊 הושלמו ${completed}/${total} (${completed - startedAt} בסשן זה)\n` +
                 `⏱️ זמן ריצה: ${sessionDur}\n` +
-                `🕐 ${nowHHMM()}`
-            );
+                `🕐 ${nowHHMM()}`;
+            if (liveId) await editTelegramMessage(liveId, stopText);
+            else await sendTelegram(stopText);
             stopReason = `Video failed on all auth sources: ${failedTitle}`;
         }
     };
