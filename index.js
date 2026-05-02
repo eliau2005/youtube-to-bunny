@@ -278,20 +278,6 @@ function maskProxyUrl(url) {
     }
 }
 
-function getAuthSources() {
-    const sources = [];
-    for (const url of getProxies()) {
-        sources.push({ type: 'proxy', value: url, label: maskProxyUrl(url) });
-    }
-    for (const file of getCookieFiles()) {
-        sources.push({ type: 'cookie', value: file, label: path.basename(file) });
-    }
-    if (sources.length === 0) {
-        sources.push({ type: 'browser', value: null, label: 'browser' });
-    }
-    return sources;
-}
-
 function buildYtdlpAuthArgs(source) {
     if (source.type === 'proxy') return ['--proxy', source.value];
     if (source.type === 'cookie') return ['--cookies', source.value];
@@ -608,36 +594,78 @@ async function run() {
     const remaining = total - completed;
     console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
 
-    // ── Refresh proxies + load collections in parallel (skip with SKIP_PROXY_FETCH=1) ─
+    // ── Streaming proxy fetcher + cookie fallback list ──────────────────────
+    // The fetcher writes proxies.txt incrementally as each proxy passes its
+    // liveness test. YouTube downloads begin as soon as the first proxy is
+    // alive; the fetcher keeps populating proxyList in the background. Cookies
+    // are only used after the proxy pool is fully exhausted (fetcher done +
+    // every proxy tried). Skip the fetcher with SKIP_PROXY_FETCH=1.
     const skipFetch = process.env.SKIP_PROXY_FETCH === '1';
-    const proxyFetchPromise = skipFetch
-        ? Promise.resolve({ count: 0, written: false, skipped: true })
+
+    const proxyList = []; // mutable, grows as the fetcher discovers alive proxies
+    const proxyAddedSignals = []; // resolvers waiting for the next proxy
+    let fetcherDone = false;
+
+    if (skipFetch) {
+        for (const url of getProxies()) {
+            proxyList.push({ type: 'proxy', value: url, label: maskProxyUrl(url) });
+        }
+    }
+
+    const cookieList = [];
+    for (const file of getCookieFiles()) {
+        cookieList.push({ type: 'cookie', value: file, label: path.basename(file) });
+    }
+    if (cookieList.length === 0) {
+        cookieList.push({ type: 'browser', value: null, label: 'browser' });
+    }
+
+    let firstProxyResolve;
+    const firstProxyReady = new Promise(r => { firstProxyResolve = r; });
+
+    const fetchPromise = skipFetch
+        ? Promise.resolve({ count: proxyList.length, written: false, skipped: true })
         : (async () => {
-            console.log('\n🌐 Refreshing free proxy pool...');
+            console.log('\n🌐 Starting proxy pool refresh in background...');
             try {
-                return await fetchAndWriteProxies({ limit: 100, timeoutMs: 4000, concurrency: 200 });
+                return await fetchAndWriteProxies({
+                    limit: 100,
+                    timeoutMs: 4000,
+                    concurrency: 200,
+                    onAlive: (url) => {
+                        proxyList.push({ type: 'proxy', value: url, label: maskProxyUrl(url) });
+                        if (firstProxyResolve) { firstProxyResolve('proxy'); firstProxyResolve = null; }
+                        while (proxyAddedSignals.length) proxyAddedSignals.shift()();
+                    }
+                });
             } catch (e) {
-                console.warn(`Proxy fetch failed: ${e.message} — continuing with existing proxies.txt (if any).`);
+                console.warn(`Proxy fetch failed: ${e.message}`);
                 return { count: 0, written: false, error: e.message };
             }
         })();
-    const [, proxyResult] = await Promise.all([loadCollections(), proxyFetchPromise]);
-    if (skipFetch) {
-        console.log('SKIP_PROXY_FETCH=1 → using existing proxies.txt as-is.');
-    } else if (proxyResult.written) {
-        console.log(`Proxy pool refreshed: ${proxyResult.count} working proxies.`);
-    }
-    // ─────────────────────────────────────────────────────────────────────────
 
-    // ── Auth source rotation setup (proxies → cookies) ───────────────────────
-    const sources = getAuthSources();
-    let sourceIndex = 0;
-    const activeSource = () => sources[sourceIndex];
-    const proxyCount = sources.filter(s => s.type === 'proxy').length;
-    const cookieCount = sources.filter(s => s.type === 'cookie').length;
-    console.log(`Auth sources: ${proxyCount} proxy(ies), ${cookieCount} cookie file(s)${proxyCount + cookieCount === 0 ? ' (using browser cookies)' : ''}`);
-    console.log(`Order: ${sources.slice(0, 5).map(s => `${s.type}:${s.label}`).join(' → ')}${sources.length > 5 ? ` → … (+${sources.length - 5})` : ''}`);
-    console.log(`Starting with: ${activeSource().type} ${activeSource().label}`);
+    fetchPromise.then(() => {
+        fetcherDone = true;
+        if (firstProxyResolve) { firstProxyResolve('done'); firstProxyResolve = null; }
+        while (proxyAddedSignals.length) proxyAddedSignals.shift()();
+    });
+
+    await loadCollections();
+
+    if (skipFetch) {
+        console.log(`SKIP_PROXY_FETCH=1 → using ${proxyList.length} existing proxies from proxies.txt.`);
+        fetcherDone = true; // no fetcher running, anything in proxyList is all we have
+    } else {
+        console.log('Waiting for first alive proxy (or fetcher to finish)...');
+        const why = await firstProxyReady;
+        if (why === 'proxy') {
+            console.log(`✅ First proxy ready (${proxyList.length} so far). Starting downloads — fetcher continues in background.`);
+        } else {
+            console.log(`⚠️  Fetcher finished with 0 working proxies. Falling back to ${cookieList.length} cookie source(s).`);
+        }
+    }
+
+    console.log(`Cookie/browser fallback(s) ready: ${cookieList.length}`);
     // ────────────────────────────────────────────────────────────────────────
 
     // ── Session stats ────────────────────────────────────────────────────────
@@ -652,8 +680,18 @@ async function run() {
         `📊 סה״כ בפלייליסט: ${total}\n` +
         `✅ כבר הועלו: ${completed}\n` +
         `⏳ נותרו לעיבוד: ${remaining}\n` +
-        `🌐 פרוקסיים: ${proxyCount} | 🍪 cookies: ${cookieCount || 'browser'}`
+        `🌐 פרוקסיים מוכנים: ${proxyList.length}${fetcherDone ? '' : ' (גדל תוך כדי)'} | 🍪 cookies fallback: ${cookieList.length}`
     );
+
+    // Sticky proxy pointer: stay on the working proxy across videos; advance only on failure.
+    // Waits for new proxies to arrive if the pointer is past the end and the fetcher is still running.
+    let currentProxyIdx = 0;
+    const waitForCurrentProxy = async () => {
+        while (currentProxyIdx >= proxyList.length && !fetcherDone) {
+            await new Promise(r => proxyAddedSignals.push(r));
+        }
+        return currentProxyIdx < proxyList.length;
+    };
 
     for (let i = 0; i < playlistData.length; i++) {
         const video = playlistData[i];
@@ -663,36 +701,47 @@ async function run() {
             continue;
         }
 
-        // Try current source; on failure, rotate through remaining sources
-        let result = await processVideo(video, buildYtdlpAuthArgs(activeSource()), {
-            videoIndex: i + 1,
-            total,
-            completed,
-            sourceType: activeSource().type,
-            sourceLabel: activeSource().label,
-            attempt: 1
-        });
+        let result = null;
+        let attempt = 0;
 
-        if (!result.success && sources.length > 1) {
-            for (let attempt = 1; attempt < sources.length; attempt++) {
-                sourceIndex = (sourceIndex + 1) % sources.length;
-                const next = activeSource();
-                const nextHeb = next.type === 'proxy' ? 'Proxy' : next.type === 'cookie' ? 'Cookie' : 'Browser';
-                console.log(`\n🔄 Switching to ${next.type}:${next.label} and retrying...`);
+        const tryWith = async (source) => {
+            attempt++;
+            if (attempt > 1) {
+                // Each proxy is a different IP, so anti-bot pacing isn't needed —
+                // a tiny 5s gap is enough. Cookies/browser keep the 30s precaution.
+                const isProxy = source.type === 'proxy';
+                const waitSec = isProxy ? 5 : 30;
+                const nextHeb = source.type === 'proxy' ? 'Proxy' : source.type === 'cookie' ? 'Cookie' : 'Browser';
+                console.log(`\n🔄 Switching to ${source.type}:${source.label} (attempt ${attempt}) — waiting ${waitSec}s...`);
                 await sendTelegram(
-                    `🔄 *מחליף ל-${nextHeb}: ${next.label}*\n` +
+                    `🔄 *מחליף ל-${nextHeb}: ${source.label}*\n` +
                     `🎬 [${i + 1}/${total}] ${video.lessonTitle || video.videoId}\n` +
-                    `🔁 ניסיון ${attempt + 1}/${sources.length} — המתנה 30 שנ׳ ואז ניסיון חוזר.`
+                    `🔁 ניסיון ${attempt} — המתנה ${waitSec} שנ׳ ואז ניסיון חוזר.`
                 );
-                await sleepWithCountdown(30, completed, total);
-                result = await processVideo(video, buildYtdlpAuthArgs(activeSource()), {
-                    videoIndex: i + 1,
-                    total,
-                    completed,
-                    sourceType: activeSource().type,
-                    sourceLabel: activeSource().label,
-                    attempt: attempt + 1
-                });
+                await sleepWithCountdown(waitSec, completed, total);
+            }
+            return await processVideo(video, buildYtdlpAuthArgs(source), {
+                videoIndex: i + 1,
+                total,
+                completed,
+                sourceType: source.type,
+                sourceLabel: source.label,
+                attempt
+            });
+        };
+
+        // Phase 1: try proxies (sticky — only advance on failure; wait for new ones if needed)
+        while (await waitForCurrentProxy()) {
+            const source = proxyList[currentProxyIdx];
+            result = await tryWith(source);
+            if (result.success) break;
+            currentProxyIdx++;
+        }
+
+        // Phase 2: cookies/browser fallback (only after proxy pool fully exhausted)
+        if (!result || !result.success) {
+            for (const source of cookieList) {
+                result = await tryWith(source);
                 if (result.success) break;
             }
         }
@@ -721,7 +770,7 @@ async function run() {
             await sendTelegram(
                 `❌ *youtube-to-bunny נעצרה!*\n` +
                 `🎬 [${i + 1}/${total}] ${failedTitle}\n` +
-                `🔁 נכשל עם כל ${sources.length} המקורות (${proxyCount} פרוקסי + ${cookieCount} cookies)\n` +
+                `🔁 נכשל עם כל ${currentProxyIdx} הפרוקסיים + ${cookieList.length} fallback(s)\n` +
                 `📊 הושלמו ${completed}/${total} (${completed - startedAt} בסשן זה)\n` +
                 `⏱️ זמן ריצה: ${sessionDur}\n` +
                 `🕐 ${nowHHMM()}`
