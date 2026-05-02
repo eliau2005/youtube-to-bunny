@@ -275,6 +275,7 @@ function listFormats(youtubeUrl, cookieArgs) {
     return new Promise((resolve) => {
         const args = [
             ...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node',
+            '--no-check-certificate',
             // Fast-fail when proxy is bad: don't internally retry (let the rotation try the next one)
             '--retries', '1', '--extractor-retries', '1', '--socket-timeout', '15',
             youtubeUrl
@@ -303,6 +304,7 @@ function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs, onProgress) {
     return new Promise((resolve, reject) => {
         const args = [
             ...cookieArgs,
+            '--no-check-certificate',
             '--no-playlist',
             '--js-runtimes', 'node',
             '--sleep-requests', '2',
