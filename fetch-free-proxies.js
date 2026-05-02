@@ -15,6 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const net = require('net');
 
 const OUT_FILE = path.join(__dirname, 'proxies.txt');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -103,8 +104,10 @@ function parseIpPort(text) {
 }
 
 // ─── Proxy liveness test ─────────────────────────────────────────────────────
-// HTTP-only test: HEAD to gstatic's tiny 204 endpoint via the proxy.
-// SOCKS proxies pass through untested (no agent dep available).
+// Tests HTTPS CONNECT tunneling against www.youtube.com:443. This is the actual
+// capability we need — many free HTTP proxies forward plain HTTP fine but reject
+// CONNECT (returning "400 Bad Request"), making them useless for HTTPS sites
+// like YouTube. SOCKS proxies pass through untested (no socks agent dep).
 function testProxy(proxyUrl, timeoutMs) {
     return new Promise((resolve) => {
         if (proxyUrl.startsWith('socks')) return resolve(true);
@@ -117,18 +120,27 @@ function testProxy(proxyUrl, timeoutMs) {
         } catch {
             return resolve(false);
         }
-        const req = http.request({
-            host, port, method: 'HEAD',
-            path: 'http://www.gstatic.com/generate_204',
-            headers: { Host: 'www.gstatic.com', 'User-Agent': UA },
-            timeout: timeoutMs
-        }, (res) => {
-            res.resume();
-            resolve(res.statusCode >= 200 && res.statusCode < 400);
+
+        let settled = false;
+        const finish = (ok) => { if (settled) return; settled = true; try { socket.destroy(); } catch (_) {} resolve(ok); };
+
+        const socket = net.createConnection({ host, port });
+        socket.setTimeout(timeoutMs);
+        let response = '';
+
+        socket.once('connect', () => {
+            socket.write('CONNECT www.youtube.com:443 HTTP/1.1\r\nHost: www.youtube.com:443\r\nProxy-Connection: keep-alive\r\n\r\n');
         });
-        req.on('timeout', () => { req.destroy(); resolve(false); });
-        req.on('error', () => resolve(false));
-        req.end();
+        socket.on('data', (chunk) => {
+            response += chunk.toString('utf8');
+            if (response.includes('\r\n\r\n')) {
+                const firstLine = response.split('\r\n')[0] || '';
+                finish(/^HTTP\/1\.\d 200/i.test(firstLine));
+            }
+        });
+        socket.on('timeout', () => finish(false));
+        socket.on('error', () => finish(false));
+        socket.on('close', () => finish(false));
     });
 }
 

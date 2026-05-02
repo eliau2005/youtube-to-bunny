@@ -273,7 +273,12 @@ function createProxyPool() {
 
 function listFormats(youtubeUrl, cookieArgs) {
     return new Promise((resolve) => {
-        const args = [...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node', youtubeUrl];
+        const args = [
+            ...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node',
+            // Fast-fail when proxy is bad: don't internally retry (let the rotation try the next one)
+            '--retries', '1', '--extractor-retries', '1', '--socket-timeout', '15',
+            youtubeUrl
+        ];
         const child = spawn('yt-dlp', args, { shell: process.platform === 'win32' });
         let output = '';
         child.stdout.on('data', d => output += d.toString());
