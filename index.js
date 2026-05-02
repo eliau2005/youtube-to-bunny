@@ -294,14 +294,30 @@ function listFormats(youtubeUrl, cookieArgs) {
     });
 }
 
+// Tries with aria2c first; on "aria2c exited with code 22" (HTTP-header issues
+// that often appear with proxies that mangle range requests), retries once on
+// the same proxy without aria2c using yt-dlp's built-in downloader.
 function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs, onProgress) {
+    return downloadAttempt(youtubeUrl, outputFile, cookieArgs, onProgress, true)
+        .catch((err) => {
+            if (/aria2c exited with code 22/i.test(err.message)) {
+                console.warn(`\n⚠️  aria2c HTTP-header error (code 22) — retrying without aria2c on the same proxy...`);
+                return downloadAttempt(youtubeUrl, outputFile, cookieArgs, onProgress, false);
+            }
+            throw err;
+        });
+}
+
+function downloadAttempt(youtubeUrl, outputFile, cookieArgs, onProgress, useAria2c) {
     return new Promise((resolve, reject) => {
         const args = [
             ...cookieArgs,
             '--no-playlist',
             '--js-runtimes', 'node',
-            '--downloader', 'aria2c',
-            '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
+            ...(useAria2c ? [
+                '--downloader', 'aria2c',
+                '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
+            ] : []),
             '--sleep-requests', '2',
             '-f', 'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best',
             '-S', 'res:1080,fps,vcodec:h264:vp9,acodec:m4a',
