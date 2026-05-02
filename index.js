@@ -305,6 +305,7 @@ function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs, onProgress) {
         const args = [
             ...cookieArgs,
             '--no-check-certificate',
+            '--no-continue',
             '--no-playlist',
             '--js-runtimes', 'node',
             '--sleep-requests', '2',
@@ -409,7 +410,12 @@ function uploadToBunny(guid, filePath, onProgress) {
 
 async function processVideo(videoObj, cookieArgs, ctx) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
+    const partFile = `${tmpFile}.part`;
     const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
+
+    // Clean up any existing files from previous failed/interrupted attempts
+    if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+    if (fs.existsSync(partFile)) fs.unlinkSync(partFile);
 
     // Header shown at top of every Telegram message for this video
     const { videoIndex, total, completed, sourceType, sourceLabel, attempt, liveId: providedLiveId } = ctx;
