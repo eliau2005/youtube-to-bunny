@@ -41,7 +41,7 @@ function sendTelegramMessage(text) {
     });
 }
 
-// Edits an existing message in-place
+// Edits an existing message in-place; handles Telegram 429 rate-limit gracefully
 function editTelegramMessage(messageId, text) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !messageId) return Promise.resolve();
     return new Promise((resolve) => {
@@ -51,7 +51,21 @@ function editTelegramMessage(messageId, text) {
             path: `/bot${TELEGRAM_BOT_TOKEN}/editMessageText`,
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-        }, (res) => { res.resume(); resolve(); });
+        }, (res) => {
+            let data = '';
+            res.on('data', d => data += d.toString());
+            res.on('end', () => {
+                if (res.statusCode === 429) {
+                    // Rate limited — parse retry-after if available and skip silently
+                    try {
+                        const parsed = JSON.parse(data);
+                        const wait = parsed?.parameters?.retry_after || 1;
+                        console.warn(`Telegram rate-limited, retry after ${wait}s (skipping this update)`);
+                    } catch {}
+                }
+                resolve();
+            });
+        });
         req.on('error', () => resolve());
         req.write(body);
         req.end();
@@ -109,14 +123,21 @@ function endProgressLine() {
     if (process.stdout.isTTY) process.stdout.write('\n');
 }
 
-function sleepWithCountdown(totalSeconds, completed, total) {
+// totalSeconds: wait duration
+// completed/total: for console label
+// liveId: optional Telegram message_id to update with countdown every 15 sec
+// lastDoneText: the completed-video summary shown above the countdown
+function sleepWithCountdown(totalSeconds, completed, total, liveId = null, lastDoneText = '') {
     return new Promise((resolve) => {
         let remaining = totalSeconds;
-        const render = () => {
-            const m = Math.floor(remaining / 60);
-            const s = remaining % 60;
-            const timeStr = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-            const line = `⏳ Next download in ${timeStr} | ${completed}/${total} videos completed`;
+
+        const fmtTime = (s) => {
+            const m = Math.floor(s / 60);
+            return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+        };
+
+        const renderConsole = () => {
+            const line = `⏳ Next download in ${fmtTime(remaining)} | ${completed}/${total} videos completed`;
             if (process.stdout.isTTY) {
                 readline.clearLine(process.stdout, 0);
                 readline.cursorTo(process.stdout, 0);
@@ -125,7 +146,19 @@ function sleepWithCountdown(totalSeconds, completed, total) {
                 process.stdout.write(line + '\n');
             }
         };
-        render();
+
+        const renderTelegram = () => {
+            if (!liveId) return;
+            const text =
+                (lastDoneText ? lastDoneText + '\n\n' : '') +
+                `⏳ *הורדה הבאה עוד:* ${fmtTime(remaining)}\n` +
+                `_הושלמו ${completed}/${total} סרטונים_`;
+            editTelegramMessage(liveId, text); // fire-and-forget
+        };
+
+        renderConsole();
+        renderTelegram(); // immediate first update
+
         const interval = setInterval(() => {
             remaining--;
             if (remaining <= 0) {
@@ -133,7 +166,9 @@ function sleepWithCountdown(totalSeconds, completed, total) {
                 if (process.stdout.isTTY) process.stdout.write('\n');
                 resolve();
             } else {
-                render();
+                renderConsole();
+                // Update Telegram every 15 seconds during the wait
+                if (remaining % 15 === 0) renderTelegram();
             }
         }, 1000);
     });
@@ -337,10 +372,11 @@ async function processVideo(videoObj, cookieArgs) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
     const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
 
-    // ── Live Telegram progress message ──────────────────────────────────────
-    let liveId = null;        // message_id of the pinned progress message
-    let lastEditAt = 0;       // timestamp of last edit
-    const THROTTLE_MS = 10000; // max one edit per 10 seconds
+    // ── Live Telegram progress message ─────────────────────────────────────
+    let liveId = null;
+    let lastEditAt = 0;
+    const DL_THROTTLE_MS  = 500;  // download updates: every 0.5 sec
+    const UPL_THROTTLE_MS = 3000; // upload updates:   every 3 sec
 
     const initLive = async (text) => {
         const msg = await sendTelegramMessage(text);
@@ -348,16 +384,23 @@ async function processVideo(videoObj, cookieArgs) {
         lastEditAt = Date.now();
     };
 
-    // Throttled edit — pass force=true to bypass throttle
-    const updateLive = (text, force = false) => {
+    const updateLive = (text, throttleMs) => {
         const now = Date.now();
-        if (!liveId || (!force && now - lastEditAt < THROTTLE_MS)) return;
+        if (!liveId || now - lastEditAt < throttleMs) return;
         lastEditAt = now;
         return editTelegramMessage(liveId, text);
     };
 
+    const forceUpdateLive = (text) => {
+        if (!liveId) return;
+        lastEditAt = Date.now();
+        return editTelegramMessage(liveId, text);
+    };
+
     const finalizeLive = (text) => editTelegramMessage(liveId, text);
-    // ────────────────────────────────────────────────────────────────────────
+    // ───────────────────────────────────────────────────────────────────────
+
+    let doneText = ''; // summary text after completion (reused in countdown)
 
     try {
         console.log(`\n--- Processing: ${title} ---`);
@@ -369,21 +412,30 @@ async function processVideo(videoObj, cookieArgs) {
             console.warn(`⚠️  WARNING: YouTube is only offering ${maxRes}p - cookies may be expired or invalid!`);
         }
 
+        const downloadStart = Date.now();
+
         await downloadFromYoutube(videoObj.youtubeUrl, tmpFile, cookieArgs, (pct, speed, eta) => {
             updateLive(
                 `🎬 *${title}*\n\n` +
                 `📥 *הורדה:* ${pct.toFixed(1)}%\n` +
                 `\`${telegramBar(pct)}\`\n` +
-                `⚡ ${speed} | ETA ${eta}`
+                `⚡ ${speed} | ETA ${eta}`,
+                DL_THROTTLE_MS
             );
         });
 
-        // Force-update to show upload phase started
-        await updateLive(
+        // Compute download stats
+        const dlDuration = Math.round((Date.now() - downloadStart) / 1000);
+        const dlDurationStr = dlDuration >= 60
+            ? `${Math.floor(dlDuration / 60)}m ${dlDuration % 60}s`
+            : `${dlDuration}s`;
+        const fileSize = fs.existsSync(tmpFile) ? formatBytes(fs.statSync(tmpFile).size) : '?';
+
+        // Force-update: download done + file stats
+        await forceUpdateLive(
             `🎬 *${title}*\n\n` +
-            `📥 הורדה: ✅ הושלמה\n` +
-            `☁️ *מעלה ל\-Bunny\.\.\.*`,
-            true
+            `📥 הורדה: ✅ הושלמה ב-${dlDurationStr} | ${fileSize}\n` +
+            `☁️ *מעלה ל\-Bunny\.\.\.*`
         );
 
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
@@ -408,20 +460,21 @@ async function processVideo(videoObj, cookieArgs) {
         await uploadToBunny(guid, tmpFile, (pct, speed, eta) => {
             updateLive(
                 `🎬 *${title}*\n\n` +
-                `📥 הורדה: ✅\n` +
+                `📥 הורדה: ✅ | ${fileSize} | ${dlDurationStr}\n` +
                 `☁️ *העלאה:* ${pct.toFixed(1)}%\n` +
                 `\`${telegramBar(pct)}\`\n` +
-                `⚡ ${speed} | ETA ${eta}`
+                `⚡ ${speed} | ETA ${eta}`,
+                UPL_THROTTLE_MS
             );
         });
 
         const bunnyStreamUrl = `https://iframe.mediadelivery.net/play/${BUNNY_LIBRARY_ID}/${guid}`;
         videoObj.youtubeUrl = bunnyStreamUrl;
 
-        // Final edit: mark as done
-        await finalizeLive(`✅ *הושלם:* "${title}"\n\n📥 הורדה: ✅\n☁️ העלאה: ✅`);
+        doneText = `✅ *הושלם:* "${title}"\n📥 הורדה: ✅ | ${fileSize} | ${dlDurationStr}\n☁️ העלאה: ✅`;
+        await finalizeLive(doneText);
         console.log(`Done: ${title}`);
-        return { success: true, videoObj };
+        return { success: true, videoObj, liveId, doneText };
 
     } catch (e) {
         console.error(`Failed on video ${title}:`, e.message);
@@ -430,7 +483,7 @@ async function processVideo(videoObj, cookieArgs) {
             console.error('  body:', JSON.stringify(e.response.data));
         }
         await finalizeLive(`❌ *נכשל:* "${title}"\n\`${e.message.slice(0, 200)}\``);
-        return { success: false, videoObj };
+        return { success: false, videoObj, liveId: null, doneText: '' };
     } finally {
         if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
     }
@@ -499,7 +552,8 @@ async function run() {
                 // Random delay 2–5 minutes to avoid bot detection
                 const delaySeconds = Math.floor(Math.random() * (300 - 120 + 1)) + 120;
                 console.log(`\n⏱️  Waiting ${Math.round(delaySeconds / 60 * 10) / 10} min before next download...`);
-                await sleepWithCountdown(delaySeconds, completed, total);
+                // Pass liveId so the countdown is shown in Telegram too
+                await sleepWithCountdown(delaySeconds, completed, total, result.liveId, result.doneText);
             }
         } else {
             // All cookie files exhausted — stop entirely
