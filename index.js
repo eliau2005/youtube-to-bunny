@@ -104,6 +104,21 @@ function formatEta(seconds) {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+function formatDuration(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '0s';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+function nowHHMM() {
+    const d = new Date();
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
 function renderProgressBar(label, percent, speed, eta) {
     const barWidth = 30;
     const clamped = Math.max(0, Math.min(100, percent));
@@ -129,15 +144,19 @@ function endProgressLine() {
 // lastDoneText: the completed-video summary shown above the countdown
 function sleepWithCountdown(totalSeconds, completed, total, liveId = null, lastDoneText = '') {
     return new Promise((resolve) => {
-        let remaining = totalSeconds;
+        const startedAt = Date.now();
+        const totalMinStr = (totalSeconds / 60).toFixed(1);
+        const TICK_MS = 100;
+        const TG_THROTTLE_MS = 100; // Telegram will 429-drop excess silently
+        let lastTgEdit = 0;
 
         const fmtTime = (s) => {
             const m = Math.floor(s / 60);
-            return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+            return `${String(m).padStart(2, '0')}:${String(Math.floor(s) % 60).padStart(2, '0')}`;
         };
 
-        const renderConsole = () => {
-            const line = `⏳ Next download in ${fmtTime(remaining)} | ${completed}/${total} videos completed`;
+        const renderConsole = (remaining) => {
+            const line = `⏳ Next download in ${fmtTime(remaining)} (random ${totalMinStr}m) | ${completed}/${total} videos completed`;
             if (process.stdout.isTTY) {
                 readline.clearLine(process.stdout, 0);
                 readline.cursorTo(process.stdout, 0);
@@ -147,30 +166,34 @@ function sleepWithCountdown(totalSeconds, completed, total, liveId = null, lastD
             }
         };
 
-        const renderTelegram = () => {
+        const renderTelegram = (remaining) => {
             if (!liveId) return;
+            const now = Date.now();
+            if (now - lastTgEdit < TG_THROTTLE_MS) return;
+            lastTgEdit = now;
             const text =
                 (lastDoneText ? lastDoneText + '\n\n' : '') +
                 `⏳ *הורדה הבאה עוד:* ${fmtTime(remaining)}\n` +
-                `_הושלמו ${completed}/${total} סרטונים_`;
+                `🎲 השהיה אקראית של ${totalMinStr} דק׳ (אנטי-בוט)\n` +
+                `📊 הושלמו ${completed}/${total} סרטונים`;
             editTelegramMessage(liveId, text); // fire-and-forget
         };
 
-        renderConsole();
-        renderTelegram(); // immediate first update
+        renderConsole(totalSeconds);
+        renderTelegram(totalSeconds); // immediate first update
 
         const interval = setInterval(() => {
-            remaining--;
+            const elapsed = (Date.now() - startedAt) / 1000;
+            const remaining = totalSeconds - elapsed;
             if (remaining <= 0) {
                 clearInterval(interval);
                 if (process.stdout.isTTY) process.stdout.write('\n');
                 resolve();
             } else {
-                renderConsole();
-                // Update Telegram every 15 seconds during the wait
-                if (remaining % 15 === 0) renderTelegram();
+                renderConsole(remaining);
+                renderTelegram(remaining);
             }
-        }, 1000);
+        }, TICK_MS);
     });
 }
 
@@ -368,15 +391,27 @@ function uploadToBunny(guid, filePath, onProgress) {
     });
 }
 
-async function processVideo(videoObj, cookieArgs) {
+async function processVideo(videoObj, cookieArgs, ctx) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
     const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
+
+    // Header shown at top of every Telegram message for this video
+    const { videoIndex, total, completed, cookieName, attempt } = ctx;
+    const overallPct = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const cookieLabel = cookieName ? ` | 🍪 ${cookieName}` : '';
+    const attemptLabel = attempt > 1 ? ` (ניסיון ${attempt})` : '';
+    const header =
+        `🎬 *[${videoIndex}/${total}]* ${title}${attemptLabel}\n` +
+        `📈 התקדמות כוללת: ${completed}/${total} (${overallPct}%)${cookieLabel}\n` +
+        `🕐 ${nowHHMM()}`;
 
     // ── Live Telegram progress message ─────────────────────────────────────
     let liveId = null;
     let lastEditAt = 0;
-    const DL_THROTTLE_MS  = 500;  // download updates: every 0.5 sec
-    const UPL_THROTTLE_MS = 3000; // upload updates:   every 3 sec
+    // Telegram caps editMessageText at ~1/sec per message; excess hits 429 and
+    // is dropped silently by editTelegramMessage. 100ms is the requested cadence.
+    const DL_THROTTLE_MS  = 100;
+    const UPL_THROTTLE_MS = 100;
 
     const initLive = async (text) => {
         const msg = await sendTelegramMessage(text);
@@ -401,22 +436,24 @@ async function processVideo(videoObj, cookieArgs) {
     // ───────────────────────────────────────────────────────────────────────
 
     let doneText = ''; // summary text after completion (reused in countdown)
+    const videoStart = Date.now();
 
     try {
-        console.log(`\n--- Processing: ${title} ---`);
-        await initLive(`🎬 *מתחיל עיבוד*\n"${title}"\n\n📥 הורדה מ\-YouTube\.\.\.`);
+        console.log(`\n--- Processing [${videoIndex}/${total}]: ${title} ---`);
+        await initLive(`${header}\n\n📥 מתחיל הורדה מ-YouTube...`);
 
         console.log('Downloading from YouTube at maximum quality...');
         const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
         if (maxRes > 0 && maxRes < 720) {
             console.warn(`⚠️  WARNING: YouTube is only offering ${maxRes}p - cookies may be expired or invalid!`);
+            await sendTelegram(`⚠️ *אזהרה:* YouTube מציע רק ${maxRes}p — ייתכן שה-cookies פגי תוקף.`);
         }
 
         const downloadStart = Date.now();
 
         await downloadFromYoutube(videoObj.youtubeUrl, tmpFile, cookieArgs, (pct, speed, eta) => {
             updateLive(
-                `🎬 *${title}*\n\n` +
+                `${header}\n\n` +
                 `📥 *הורדה:* ${pct.toFixed(1)}%\n` +
                 `\`${telegramBar(pct)}\`\n` +
                 `⚡ ${speed} | ETA ${eta}`,
@@ -426,16 +463,15 @@ async function processVideo(videoObj, cookieArgs) {
 
         // Compute download stats
         const dlDuration = Math.round((Date.now() - downloadStart) / 1000);
-        const dlDurationStr = dlDuration >= 60
-            ? `${Math.floor(dlDuration / 60)}m ${dlDuration % 60}s`
-            : `${dlDuration}s`;
-        const fileSize = fs.existsSync(tmpFile) ? formatBytes(fs.statSync(tmpFile).size) : '?';
+        const dlDurationStr = formatDuration(dlDuration);
+        const fileSizeBytes = fs.existsSync(tmpFile) ? fs.statSync(tmpFile).size : 0;
+        const fileSize = fileSizeBytes ? formatBytes(fileSizeBytes) : '?';
 
         // Force-update: download done + file stats
         await forceUpdateLive(
-            `🎬 *${title}*\n\n` +
-            `📥 הורדה: ✅ הושלמה ב-${dlDurationStr} | ${fileSize}\n` +
-            `☁️ *מעלה ל\-Bunny\.\.\.*`
+            `${header}\n\n` +
+            `📥 הורדה ✅ ${dlDurationStr} | ${fileSize}\n` +
+            `☁️ מתחיל העלאה ל-Bunny...`
         );
 
         const collectionId = await getOrCreateCollection(videoObj.subCategory);
@@ -456,25 +492,38 @@ async function processVideo(videoObj, cookieArgs) {
         );
         const guid = createRes.data.guid;
 
+        const uploadStart = Date.now();
         console.log('Uploading to Bunny...');
         await uploadToBunny(guid, tmpFile, (pct, speed, eta) => {
             updateLive(
-                `🎬 *${title}*\n\n` +
-                `📥 הורדה: ✅ | ${fileSize} | ${dlDurationStr}\n` +
+                `${header}\n\n` +
+                `📥 הורדה ✅ ${dlDurationStr} | ${fileSize}\n` +
                 `☁️ *העלאה:* ${pct.toFixed(1)}%\n` +
                 `\`${telegramBar(pct)}\`\n` +
                 `⚡ ${speed} | ETA ${eta}`,
                 UPL_THROTTLE_MS
             );
         });
+        const ulDuration = Math.round((Date.now() - uploadStart) / 1000);
+        const ulDurationStr = formatDuration(ulDuration);
 
         const bunnyStreamUrl = `https://iframe.mediadelivery.net/play/${BUNNY_LIBRARY_ID}/${guid}`;
         videoObj.youtubeUrl = bunnyStreamUrl;
 
-        doneText = `✅ *הושלם:* "${title}"\n📥 הורדה: ✅ | ${fileSize} | ${dlDurationStr}\n☁️ העלאה: ✅`;
+        const totalDur = formatDuration(Math.round((Date.now() - videoStart) / 1000));
+        const completedAfter = completed + 1;
+        const overallPctAfter = total > 0 ? Math.round((completedAfter / total) * 100) : 0;
+
+        doneText =
+            `✅ *הושלם [${videoIndex}/${total}]:* ${title}\n` +
+            `📥 הורדה ✅ ${dlDurationStr} | ${fileSize}\n` +
+            `☁️ העלאה ✅ ${ulDurationStr}\n` +
+            `⏱️ זמן כולל: ${totalDur}\n` +
+            `📊 סה״כ הושלמו: ${completedAfter}/${total} (${overallPctAfter}%)`;
+
         await finalizeLive(doneText);
-        console.log(`Done: ${title}`);
-        return { success: true, videoObj, liveId, doneText };
+        console.log(`Done: ${title} (${totalDur})`);
+        return { success: true, videoObj, liveId, doneText, bytes: fileSizeBytes };
 
     } catch (e) {
         console.error(`Failed on video ${title}:`, e.message);
@@ -482,8 +531,12 @@ async function processVideo(videoObj, cookieArgs) {
             console.error('  status:', e.response.status);
             console.error('  body:', JSON.stringify(e.response.data));
         }
-        await finalizeLive(`❌ *נכשל:* "${title}"\n\`${e.message.slice(0, 200)}\``);
-        return { success: false, videoObj, liveId: null, doneText: '' };
+        await finalizeLive(
+            `❌ *נכשל [${videoIndex}/${total}]:* ${title}${attemptLabel}\n` +
+            (cookieName ? `🍪 cookie: ${cookieName}\n` : '') +
+            `\`${e.message.slice(0, 300)}\``
+        );
+        return { success: false, videoObj, liveId: null, doneText: '', bytes: 0 };
     } finally {
         if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
     }
@@ -498,12 +551,18 @@ async function run() {
     const playlistData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     const total = playlistData.length;
     let completed = playlistData.filter(v => v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')).length;
+    const startedAt = completed; // for session-stats (how many we did THIS run)
+    const remaining = total - completed;
     console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
 
     // ── Cookie rotation setup ────────────────────────────────────────────────
     const cookieFiles = getCookieFiles();
     let cookieIndex = 0;
     const activeCookieFile = () => cookieFiles[cookieIndex] || null;
+    const activeCookieName = () => {
+        const f = activeCookieFile();
+        return f ? path.basename(f) : 'browser';
+    };
     if (cookieFiles.length > 0) {
         console.log(`Found ${cookieFiles.length} cookie file(s): ${cookieFiles.map(f => path.basename(f)).join(', ')}`);
         console.log(`Starting with: ${path.basename(cookieFiles[0])}`);
@@ -514,6 +573,21 @@ async function run() {
 
     await loadCollections();
 
+    // ── Session stats ────────────────────────────────────────────────────────
+    const sessionStart = Date.now();
+    let sessionBytes = 0;
+    let sessionFailures = 0;
+    // ────────────────────────────────────────────────────────────────────────
+
+    await sendTelegram(
+        `🚀 *youtube-to-bunny התחיל*\n` +
+        `🕐 ${nowHHMM()}\n` +
+        `📊 סה״כ בפלייליסט: ${total}\n` +
+        `✅ כבר הועלו: ${completed}\n` +
+        `⏳ נותרו לעיבוד: ${remaining}\n` +
+        `🍪 קבצי cookies: ${cookieFiles.length || 'browser'}`
+    );
+
     for (let i = 0; i < playlistData.length; i++) {
         const video = playlistData[i];
 
@@ -523,7 +597,13 @@ async function run() {
         }
 
         // Try with current cookie file; on failure, rotate through remaining ones
-        let result = await processVideo(video, buildCookieArgs(activeCookieFile()));
+        let result = await processVideo(video, buildCookieArgs(activeCookieFile()), {
+            videoIndex: i + 1,
+            total,
+            completed,
+            cookieName: activeCookieName(),
+            attempt: 1
+        });
 
         if (!result.success && cookieFiles.length > 1) {
             // Try remaining cookie files before giving up
@@ -532,35 +612,51 @@ async function run() {
                 const nextFile = path.basename(cookieFiles[cookieIndex]);
                 console.log(`\n🔄 Switching to ${nextFile} and retrying...`);
                 await sendTelegram(
-                    `🔄 *Cookie הוחלף ל-${nextFile}*\nהסרטון "${video.lessonTitle || video.videoId}" נכשל — מנסה שוב עם קובץ cookies אחר.`
+                    `🔄 *מחליף Cookie ל-${nextFile}*\n` +
+                    `🎬 [${i + 1}/${total}] ${video.lessonTitle || video.videoId}\n` +
+                    `🔁 ניסיון ${attempt + 1}/${cookieFiles.length} — המתנה 30 שנ׳ ואז ניסיון חוזר.`
                 );
                 // Short pause before retry
                 await sleepWithCountdown(30, completed, total);
-                result = await processVideo(video, buildCookieArgs(activeCookieFile()));
+                result = await processVideo(video, buildCookieArgs(activeCookieFile()), {
+                    videoIndex: i + 1,
+                    total,
+                    completed,
+                    cookieName: activeCookieName(),
+                    attempt: attempt + 1
+                });
                 if (result.success) break;
             }
         }
 
         if (result.success) {
             completed++;
+            sessionBytes += result.bytes || 0;
             console.log(`Progress: ${completed}/${total} videos completed.`);
             // Save progress after each success
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
 
             const hasMore = playlistData.slice(i + 1).some(v => !(v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')));
             if (hasMore) {
-                // Random delay 2–5 minutes to avoid bot detection
-                const delaySeconds = Math.floor(Math.random() * (300 - 120 + 1)) + 120;
-                console.log(`\n⏱️  Waiting ${Math.round(delaySeconds / 60 * 10) / 10} min before next download...`);
+                // Random delay 2–6 minutes to avoid bot detection
+                const delaySeconds = Math.floor(Math.random() * (360 - 120 + 1)) + 120;
+                console.log(`\n⏱️  Waiting ${(delaySeconds / 60).toFixed(1)} min before next download...`);
                 // Pass liveId so the countdown is shown in Telegram too
                 await sleepWithCountdown(delaySeconds, completed, total, result.liveId, result.doneText);
             }
         } else {
             // All cookie files exhausted — stop entirely
+            sessionFailures++;
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
             const failedTitle = video.lessonTitle || video.videoId || 'לא ידוע';
+            const sessionDur = formatDuration(Math.round((Date.now() - sessionStart) / 1000));
             await sendTelegram(
-                `❌ *youtube-to-bunny נעצרה!*\nהסרטון "${failedTitle}" נכשל עם כל קבצי ה-cookies.\n_הושלמו ${completed}/${total} לפני הכישלון._`
+                `❌ *youtube-to-bunny נעצרה!*\n` +
+                `🎬 [${i + 1}/${total}] ${failedTitle}\n` +
+                `🍪 נכשל עם כל ${cookieFiles.length} קבצי ה-cookies\n` +
+                `📊 הושלמו ${completed}/${total} (${completed - startedAt} בסשן זה)\n` +
+                `⏱️ זמן ריצה: ${sessionDur}\n` +
+                `🕐 ${nowHHMM()}`
             );
             throw new Error(`Video failed on all cookie files: ${failedTitle}`);
         }
@@ -568,7 +664,17 @@ async function run() {
 
     fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
     console.log('\nSync complete and updated file saved successfully!');
-    await sendTelegram(`✅ *youtube-to-bunny הסתיים!*\n${completed}/${total} סרטונים הועלו בהצלחה.`);
+
+    const sessionDur = formatDuration(Math.round((Date.now() - sessionStart) / 1000));
+    const doneThisSession = completed - startedAt;
+    await sendTelegram(
+        `🎉 *youtube-to-bunny הסתיים בהצלחה!*\n` +
+        `✅ סה״כ הושלמו: ${completed}/${total}\n` +
+        `🆕 הועלו בסשן זה: ${doneThisSession}\n` +
+        `📦 נתונים שעובדו: ${formatBytes(sessionBytes)}\n` +
+        `⏱️ זמן ריצה: ${sessionDur}\n` +
+        `🕐 ${nowHHMM()}`
+    );
 }
 
 run().catch(async (err) => {
