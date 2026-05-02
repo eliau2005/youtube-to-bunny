@@ -244,21 +244,61 @@ async function getOrCreateCollection(name) {
     }
 }
 
-// ─── Cookie Rotation ──────────────────────────────────────────────────────────
+// ─── Auth Source Rotation (proxies first, cookies as fallback) ───────────────
+// Order: try every proxy in proxies.txt without cookies; if all fail, fall back
+// through cookie files (cookies1.txt → cookies2.txt → cookies3.txt → plain
+// cookies.txt → browser cookies). Each source is tried per-video before giving up.
+
+function getProxies() {
+    const proxiesFile = path.join(__dirname, 'proxies.txt');
+    if (!fs.existsSync(proxiesFile)) return [];
+    return fs.readFileSync(proxiesFile, 'utf8')
+        .split(/\r?\n/)
+        .map(l => l.trim())
+        .filter(l => l && !l.startsWith('#'));
+}
+
 function getCookieFiles() {
-    // Support cookies1.txt, cookies2.txt, cookies3.txt  (or plain cookies.txt as fallback)
     const numbered = [1, 2, 3]
         .map(n => path.join(__dirname, `cookies${n}.txt`))
         .filter(f => fs.existsSync(f));
     if (numbered.length > 0) return numbered;
     const plain = path.join(__dirname, 'cookies.txt');
     if (fs.existsSync(plain)) return [plain];
-    return []; // will fall back to --cookies-from-browser chrome
+    return [];
 }
 
-function buildCookieArgs(cookieFile) {
-    if (!cookieFile) return ['--cookies-from-browser', 'chrome'];
-    return ['--cookies', cookieFile];
+function maskProxyUrl(url) {
+    try {
+        const u = new URL(url);
+        return u.username ? `${u.protocol}//***@${u.host}` : `${u.protocol}//${u.host}`;
+    } catch {
+        return url;
+    }
+}
+
+function getAuthSources() {
+    const sources = [];
+    for (const url of getProxies()) {
+        sources.push({ type: 'proxy', value: url, label: maskProxyUrl(url) });
+    }
+    for (const file of getCookieFiles()) {
+        sources.push({ type: 'cookie', value: file, label: path.basename(file) });
+    }
+    if (sources.length === 0) {
+        sources.push({ type: 'browser', value: null, label: 'browser' });
+    }
+    return sources;
+}
+
+function buildYtdlpAuthArgs(source) {
+    if (source.type === 'proxy') return ['--proxy', source.value];
+    if (source.type === 'cookie') return ['--cookies', source.value];
+    return ['--cookies-from-browser', 'chrome'];
+}
+
+function sourceEmoji(type) {
+    return type === 'proxy' ? '🌐' : type === 'cookie' ? '🍪' : '💻';
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -410,13 +450,13 @@ async function processVideo(videoObj, cookieArgs, ctx) {
     const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
 
     // Header shown at top of every Telegram message for this video
-    const { videoIndex, total, completed, cookieName, attempt } = ctx;
+    const { videoIndex, total, completed, sourceType, sourceLabel, attempt } = ctx;
     const overallPct = total > 0 ? Math.round((completed / total) * 100) : 0;
-    const cookieLabel = cookieName ? ` | 🍪 ${cookieName}` : '';
+    const sourceTag = sourceLabel ? ` | ${sourceEmoji(sourceType)} ${sourceLabel}` : '';
     const attemptLabel = attempt > 1 ? ` (ניסיון ${attempt})` : '';
     const header =
         `🎬 *[${videoIndex}/${total}]* ${title}${attemptLabel}\n` +
-        `📈 התקדמות כוללת: ${completed}/${total} (${overallPct}%)${cookieLabel}\n` +
+        `📈 התקדמות כוללת: ${completed}/${total} (${overallPct}%)${sourceTag}\n` +
         `🕐 ${nowHHMM()}`;
 
     // ── Live Telegram progress message ─────────────────────────────────────
@@ -545,7 +585,7 @@ async function processVideo(videoObj, cookieArgs, ctx) {
         }
         await finalizeLive(
             `❌ *נכשל [${videoIndex}/${total}]:* ${title}${attemptLabel}\n` +
-            (cookieName ? `🍪 cookie: ${cookieName}\n` : '') +
+            (sourceLabel ? `${sourceEmoji(sourceType)} ${sourceType}: ${sourceLabel}\n` : '') +
             `\`${e.message.slice(0, 300)}\``
         );
         return { success: false, videoObj, liveId: null, doneText: '', bytes: 0 };
@@ -567,20 +607,15 @@ async function run() {
     const remaining = total - completed;
     console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
 
-    // ── Cookie rotation setup ────────────────────────────────────────────────
-    const cookieFiles = getCookieFiles();
-    let cookieIndex = 0;
-    const activeCookieFile = () => cookieFiles[cookieIndex] || null;
-    const activeCookieName = () => {
-        const f = activeCookieFile();
-        return f ? path.basename(f) : 'browser';
-    };
-    if (cookieFiles.length > 0) {
-        console.log(`Found ${cookieFiles.length} cookie file(s): ${cookieFiles.map(f => path.basename(f)).join(', ')}`);
-        console.log(`Starting with: ${path.basename(cookieFiles[0])}`);
-    } else {
-        console.log('No cookie files found — will use browser cookies.');
-    }
+    // ── Auth source rotation setup (proxies → cookies) ───────────────────────
+    const sources = getAuthSources();
+    let sourceIndex = 0;
+    const activeSource = () => sources[sourceIndex];
+    const proxyCount = sources.filter(s => s.type === 'proxy').length;
+    const cookieCount = sources.filter(s => s.type === 'cookie').length;
+    console.log(`Auth sources: ${proxyCount} proxy(ies), ${cookieCount} cookie file(s)${proxyCount + cookieCount === 0 ? ' (using browser cookies)' : ''}`);
+    console.log(`Order: ${sources.map(s => `${s.type}:${s.label}`).join(' → ')}`);
+    console.log(`Starting with: ${activeSource().type} ${activeSource().label}`);
     // ────────────────────────────────────────────────────────────────────────
 
     await loadCollections();
@@ -597,7 +632,7 @@ async function run() {
         `📊 סה״כ בפלייליסט: ${total}\n` +
         `✅ כבר הועלו: ${completed}\n` +
         `⏳ נותרו לעיבוד: ${remaining}\n` +
-        `🍪 קבצי cookies: ${cookieFiles.length || 'browser'}`
+        `🌐 פרוקסיים: ${proxyCount} | 🍪 cookies: ${cookieCount || 'browser'}`
     );
 
     for (let i = 0; i < playlistData.length; i++) {
@@ -608,33 +643,34 @@ async function run() {
             continue;
         }
 
-        // Try with current cookie file; on failure, rotate through remaining ones
-        let result = await processVideo(video, buildCookieArgs(activeCookieFile()), {
+        // Try current source; on failure, rotate through remaining sources
+        let result = await processVideo(video, buildYtdlpAuthArgs(activeSource()), {
             videoIndex: i + 1,
             total,
             completed,
-            cookieName: activeCookieName(),
+            sourceType: activeSource().type,
+            sourceLabel: activeSource().label,
             attempt: 1
         });
 
-        if (!result.success && cookieFiles.length > 1) {
-            // Try remaining cookie files before giving up
-            for (let attempt = 1; attempt < cookieFiles.length; attempt++) {
-                cookieIndex = (cookieIndex + 1) % cookieFiles.length;
-                const nextFile = path.basename(cookieFiles[cookieIndex]);
-                console.log(`\n🔄 Switching to ${nextFile} and retrying...`);
+        if (!result.success && sources.length > 1) {
+            for (let attempt = 1; attempt < sources.length; attempt++) {
+                sourceIndex = (sourceIndex + 1) % sources.length;
+                const next = activeSource();
+                const nextHeb = next.type === 'proxy' ? 'Proxy' : next.type === 'cookie' ? 'Cookie' : 'Browser';
+                console.log(`\n🔄 Switching to ${next.type}:${next.label} and retrying...`);
                 await sendTelegram(
-                    `🔄 *מחליף Cookie ל-${nextFile}*\n` +
+                    `🔄 *מחליף ל-${nextHeb}: ${next.label}*\n` +
                     `🎬 [${i + 1}/${total}] ${video.lessonTitle || video.videoId}\n` +
-                    `🔁 ניסיון ${attempt + 1}/${cookieFiles.length} — המתנה 30 שנ׳ ואז ניסיון חוזר.`
+                    `🔁 ניסיון ${attempt + 1}/${sources.length} — המתנה 30 שנ׳ ואז ניסיון חוזר.`
                 );
-                // Short pause before retry
                 await sleepWithCountdown(30, completed, total);
-                result = await processVideo(video, buildCookieArgs(activeCookieFile()), {
+                result = await processVideo(video, buildYtdlpAuthArgs(activeSource()), {
                     videoIndex: i + 1,
                     total,
                     completed,
-                    cookieName: activeCookieName(),
+                    sourceType: activeSource().type,
+                    sourceLabel: activeSource().label,
                     attempt: attempt + 1
                 });
                 if (result.success) break;
@@ -657,7 +693,7 @@ async function run() {
                 await sleepWithCountdown(delaySeconds, completed, total, result.liveId, result.doneText);
             }
         } else {
-            // All cookie files exhausted — stop entirely
+            // All sources exhausted — stop entirely
             sessionFailures++;
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
             const failedTitle = video.lessonTitle || video.videoId || 'לא ידוע';
@@ -665,12 +701,12 @@ async function run() {
             await sendTelegram(
                 `❌ *youtube-to-bunny נעצרה!*\n` +
                 `🎬 [${i + 1}/${total}] ${failedTitle}\n` +
-                `🍪 נכשל עם כל ${cookieFiles.length} קבצי ה-cookies\n` +
+                `🔁 נכשל עם כל ${sources.length} המקורות (${proxyCount} פרוקסי + ${cookieCount} cookies)\n` +
                 `📊 הושלמו ${completed}/${total} (${completed - startedAt} בסשן זה)\n` +
                 `⏱️ זמן ריצה: ${sessionDur}\n` +
                 `🕐 ${nowHHMM()}`
             );
-            throw new Error(`Video failed on all cookie files: ${failedTitle}`);
+            throw new Error(`Video failed on all auth sources: ${failedTitle}`);
         }
     }
 
