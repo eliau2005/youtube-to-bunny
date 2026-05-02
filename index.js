@@ -5,7 +5,6 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const https = require('https');
-const { fetchAndWriteProxies } = require('./fetch-free-proxies');
 
 const { BUNNY_LIBRARY_ID, BUNNY_API_KEY } = process.env;
 
@@ -186,19 +185,10 @@ async function getOrCreateCollection(name) {
     }
 }
 
-// ─── Auth Source Rotation (proxies first, cookies as fallback) ───────────────
-// Order: try every proxy in proxies.txt without cookies; if all fail, fall back
-// through cookie files (cookies1.txt → cookies2.txt → cookies3.txt → plain
-// cookies.txt → browser cookies). Each source is tried per-video before giving up.
-
-function getProxies() {
-    const proxiesFile = path.join(__dirname, 'proxies.txt');
-    if (!fs.existsSync(proxiesFile)) return [];
-    return fs.readFileSync(proxiesFile, 'utf8')
-        .split(/\r?\n/)
-        .map(l => l.trim())
-        .filter(l => l && !l.startsWith('#'));
-}
+// ─── Auth Source Rotation ────────────────────────────────────────────────────
+// Try direct (no auth) first; on failure, fall back through cookies1.txt →
+// cookies2.txt → cookies3.txt → plain cookies.txt. The active source is sticky
+// across videos: only advances when the current one fails for a video.
 
 function getCookieFiles() {
     const numbered = [1, 2, 3]
@@ -210,76 +200,27 @@ function getCookieFiles() {
     return [];
 }
 
-function maskProxyUrl(url) {
-    try {
-        const u = new URL(url);
-        return u.username ? `${u.protocol}//***@${u.host}` : `${u.protocol}//${u.host}`;
-    } catch {
-        return url;
+function buildAuthSources() {
+    const sources = [{ type: 'direct', value: null, label: 'no-auth' }];
+    for (const file of getCookieFiles()) {
+        sources.push({ type: 'cookie', value: file, label: path.basename(file) });
     }
+    return sources;
 }
 
 function buildYtdlpAuthArgs(source) {
-    if (source.type === 'proxy') return ['--proxy', source.value];
     if (source.type === 'cookie') return ['--cookies', source.value];
-    return ['--cookies-from-browser', 'chrome'];
+    return []; // direct: no auth args
 }
 
 function sourceEmoji(type) {
-    return type === 'proxy' ? '🌐' : type === 'cookie' ? '🍪' : '💻';
-}
-
-// Concurrent proxy pool: each proxy is checked out by at most one worker at a
-// time. checkout() blocks until a proxy is available or the pool is permanently
-// exhausted (fetcher done, no in-flight checkouts that might be returned).
-function createProxyPool() {
-    const available = [];
-    const signals = [];
-    let inUse = 0;
-    let fetcherDone = false;
-    let totalAdded = 0;
-
-    const notify = () => { while (signals.length) signals.shift()(); };
-
-    return {
-        add(url) {
-            available.push({ type: 'proxy', value: url, label: maskProxyUrl(url) });
-            totalAdded++;
-            notify();
-        },
-        markFetcherDone() {
-            fetcherDone = true;
-            notify();
-        },
-        async checkout() {
-            while (true) {
-                if (available.length > 0) {
-                    inUse++;
-                    return available.shift();
-                }
-                if (fetcherDone && inUse === 0) return null; // permanently exhausted
-                await new Promise(r => signals.push(r));
-            }
-        },
-        return(source) { inUse--; available.push(source); notify(); },
-        discard() { inUse--; notify(); },
-        get count() { return totalAdded; },
-        get availableCount() { return available.length; },
-        get inUseCount() { return inUse; },
-        get done() { return fetcherDone; }
-    };
+    return type === 'cookie' ? '🍪' : '🌐';
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
 function listFormats(youtubeUrl, cookieArgs) {
     return new Promise((resolve, reject) => {
-        const args = [
-            ...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node',
-            '--no-check-certificate',
-            // Increase timeout and retries for slow proxies
-            '--retries', '3', '--extractor-retries', '3', '--socket-timeout', '30',
-            youtubeUrl
-        ];
+        const args = [...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node', youtubeUrl];
         const child = spawn('yt-dlp', args, { shell: process.platform === 'win32' });
         let output = '';
         let stderr = '';
@@ -313,14 +254,11 @@ function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs, onProgress) {
     return new Promise((resolve, reject) => {
         const args = [
             ...cookieArgs,
-            '--no-check-certificate',
-            '--no-continue',
             '--no-playlist',
             '--js-runtimes', 'node',
+            '--downloader', 'aria2c',
+            '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
             '--sleep-requests', '2',
-            '--retries', '5',
-            '--fragment-retries', '10',
-            '--socket-timeout', '30',
             '-f', 'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best',
             '-S', 'res:1080,fps,vcodec:h264:vp9,acodec:m4a',
             '--merge-output-format', 'mp4',
@@ -347,6 +285,19 @@ function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs, onProgress) {
                     renderProgressBar('Downloading', percent, speedStr || 'N/A', etaStr || '--:--');
                     activeBar = true;
                     if (onProgress) onProgress(percent, speedStr || 'N/A', etaStr || '--:--');
+                }
+            } else if (line.startsWith('[#')) {
+                // aria2c summary line: [#abc 12345/67890MiB(18%) CN:1 DL:5MiB ETA:30s]
+                const pctMatch = line.match(/\((\d+(?:\.\d+)?)%\)/);
+                if (pctMatch) {
+                    const dlMatch = line.match(/DL:(\S+?)(?=[\s\]])/);
+                    const etaMatch = line.match(/ETA:(\S+?)(?=[\s\]])/);
+                    const percent = parseFloat(pctMatch[1]);
+                    const speed = dlMatch ? dlMatch[1] + '/s' : 'N/A';
+                    const eta = etaMatch ? etaMatch[1] : '--:--';
+                    renderProgressBar('Downloading', percent, speed, eta);
+                    activeBar = true;
+                    if (onProgress) onProgress(percent, speed, eta);
                 }
             } else if (line.includes('[Merger]')) {
                 if (activeBar) { endProgressLine(); activeBar = false; }
@@ -593,83 +544,23 @@ async function run() {
     const remaining = total - completed;
     console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
 
-    // ── Streaming proxy fetcher + concurrent worker pool ────────────────────
-    // The fetcher writes proxies.txt incrementally as each proxy passes its
-    // liveness test. YouTube downloads begin as soon as the first proxy is
-    // alive; the fetcher keeps populating the pool in the background.
-    //
-    // Up to PARALLEL_DOWNLOADS videos are processed concurrently — each worker
-    // checks out a different proxy from the pool, so videos never share an IP.
-    // Cookies/browser are tried only after the proxy pool is fully exhausted.
-    // Skip the fetcher with SKIP_PROXY_FETCH=1.
-    const skipFetch = process.env.SKIP_PROXY_FETCH === '1';
-    const MAX_PARALLEL = Math.max(1, parseInt(process.env.PARALLEL_DOWNLOADS || '3', 10));
-
-    const proxyPool = createProxyPool();
-
-    if (skipFetch) {
-        for (const url of getProxies()) proxyPool.add(url);
-    }
-
-    const cookieList = [];
-    for (const file of getCookieFiles()) {
-        cookieList.push({ type: 'cookie', value: file, label: path.basename(file) });
-    }
-    if (cookieList.length === 0) {
-        cookieList.push({ type: 'browser', value: null, label: 'browser' });
-    }
-
-    let firstProxyResolve;
-    const firstProxyReady = new Promise(r => { firstProxyResolve = r; });
-
-    const fetchPromise = skipFetch
-        ? Promise.resolve({ count: proxyPool.count, written: false, skipped: true })
-        : (async () => {
-            console.log('\n🌐 Starting proxy pool refresh in background...');
-            try {
-                return await fetchAndWriteProxies({
-                    limit: 100,
-                    timeoutMs: 4000,
-                    concurrency: 200,
-                    onAlive: (url) => {
-                        proxyPool.add(url);
-                        if (firstProxyResolve) { firstProxyResolve('proxy'); firstProxyResolve = null; }
-                    }
-                });
-            } catch (e) {
-                console.warn(`Proxy fetch failed: ${e.message}`);
-                return { count: 0, written: false, error: e.message };
-            }
-        })();
-
-    fetchPromise.then(() => {
-        proxyPool.markFetcherDone();
-        if (firstProxyResolve) { firstProxyResolve('done'); firstProxyResolve = null; }
-    });
+    // ── Auth source rotation setup ──────────────────────────────────────────
+    // direct first; on failure rotate cookies1 → cookies2 → cookies3 → plain.
+    // The active source is sticky: stays on whichever last worked, advances
+    // only when it fails for a video.
+    const sources = buildAuthSources();
+    let sourceIdx = 0;
+    const activeSource = () => sources[sourceIdx];
+    const cookieCount = sources.filter(s => s.type === 'cookie').length;
+    console.log(`Auth sources: direct + ${cookieCount} cookie file(s)`);
+    console.log(`Order: ${sources.map(s => `${s.type}:${s.label}`).join(' → ')}`);
 
     await loadCollections();
 
-    if (skipFetch) {
-        console.log(`SKIP_PROXY_FETCH=1 → using ${proxyPool.count} existing proxies from proxies.txt.`);
-        proxyPool.markFetcherDone();
-    } else {
-        console.log('Waiting for first alive proxy (or fetcher to finish)...');
-        const why = await firstProxyReady;
-        if (why === 'proxy') {
-            console.log(`✅ First proxy ready (${proxyPool.count} so far). Starting downloads — fetcher continues in background.`);
-        } else {
-            console.log(`⚠️  Fetcher finished with 0 working proxies. Falling back to ${cookieList.length} cookie source(s).`);
-        }
-    }
-
-    console.log(`Workers: ${MAX_PARALLEL} parallel | Cookie/browser fallback(s): ${cookieList.length}`);
-    // ────────────────────────────────────────────────────────────────────────
-
-    // ── Session stats ────────────────────────────────────────────────────────
+    // ── Session stats ──────────────────────────────────────────────────────
     const sessionStart = Date.now();
     let sessionBytes = 0;
     let sessionFailures = 0;
-    // ────────────────────────────────────────────────────────────────────────
 
     await sendTelegram(
         `🚀 *youtube-to-bunny התחיל*\n` +
@@ -677,58 +568,47 @@ async function run() {
         `📊 סה״כ בפלייליסט: ${total}\n` +
         `✅ כבר הועלו: ${completed}\n` +
         `⏳ נותרו לעיבוד: ${remaining}\n` +
-        `🌐 פרוקסיים מוכנים: ${proxyPool.count}${proxyPool.done ? '' : ' (גדל תוך כדי)'} | ⚙️ עיבוד מקבילי: ${MAX_PARALLEL} | 🍪 cookies fallback: ${cookieList.length}`
+        `🌐 ישיר + 🍪 ${cookieCount} cookies fallback`
     );
 
-    // ── Worker pool: each worker pulls next video, then next proxy, processes it ──
-    const todo = [];
     for (let i = 0; i < playlistData.length; i++) {
-        const v = playlistData[i];
-        if (v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')) {
-            console.log(`Skipping, already on Bunny: ${v.lessonTitle}`);
+        const video = playlistData[i];
+
+        if (video.youtubeUrl && video.youtubeUrl.includes('mediadelivery.net')) {
+            console.log(`Skipping, already on Bunny: ${video.lessonTitle}`);
             continue;
         }
-        todo.push({ video: v, globalIdx: i });
-    }
-    let cursor = 0;
-    let stopReason = null;
 
-    const processOneVideo = async (video, globalIdx) => {
         let result = null;
         let attempt = 0;
 
-        // ONE Telegram message per video — edited throughout (waiting → switching →
-        // download → upload → success/failure). Created here, passed via ctx.liveId
-        // into processVideo so all updates land on the same message.
+        // ONE telegram message per video — edited throughout (download → switching → success/failure).
         const title = video.lessonTitle || video.videoId || 'Unknown';
         const overallPct = total > 0 ? Math.round((completed / total) * 100) : 0;
         const startMsg = await sendTelegramMessage(
-            `🎬 *[${globalIdx + 1}/${total}]* ${title}\n` +
+            `🎬 *[${i + 1}/${total}]* ${title}\n` +
             `📈 התקדמות: ${completed}/${total} (${overallPct}%)\n` +
             `🕐 ${nowHHMM()}\n\n` +
-            `⏳ ממתין לפרוקסי זמין...`
+            `📥 מתחיל...`
         );
         const liveId = startMsg?.message_id || null;
 
         const tryWith = async (source) => {
             attempt++;
             if (attempt > 1) {
-                // Different IP per proxy → 5s is enough. Cookies/browser keep 30s anti-bot pause.
-                const isProxy = source.type === 'proxy';
-                const waitSec = isProxy ? 5 : 30;
-                const nextHeb = source.type === 'proxy' ? 'Proxy' : source.type === 'cookie' ? 'Cookie' : 'Browser';
-                console.log(`\n🔄 [${globalIdx + 1}] Switching to ${source.type}:${source.label} (attempt ${attempt}) — waiting ${waitSec}s...`);
+                const nextHeb = source.type === 'cookie' ? 'Cookie' : 'ישיר';
+                console.log(`\n🔄 Switching to ${source.type}:${source.label} (attempt ${attempt}) — waiting 30s...`);
                 if (liveId) {
                     await editTelegramMessage(liveId,
-                        `🎬 *[${globalIdx + 1}/${total}]* ${title}\n` +
+                        `🎬 *[${i + 1}/${total}]* ${title}\n` +
                         `🔄 *מחליף ל-${nextHeb}: ${source.label}*\n` +
-                        `🔁 ניסיון ${attempt} — המתנה ${waitSec} שנ׳`
+                        `🔁 ניסיון ${attempt} — המתנה 30 שנ׳`
                     );
                 }
-                await new Promise(r => setTimeout(r, waitSec * 1000));
+                await new Promise(r => setTimeout(r, 30 * 1000));
             }
             return await processVideo(video, buildYtdlpAuthArgs(source), {
-                videoIndex: globalIdx + 1,
+                videoIndex: i + 1,
                 total,
                 completed,
                 sourceType: source.type,
@@ -738,67 +618,44 @@ async function run() {
             });
         };
 
-        // Phase 1: try proxies via the pool (each worker holds at most one)
-        while (!stopReason) {
-            const proxy = await proxyPool.checkout();
-            if (!proxy) break;
-            result = await tryWith(proxy);
-            if (result.success) {
-                proxyPool.return(proxy); // good — back into the pool for other workers
-                break;
-            }
-            proxyPool.discard(proxy); // bad — drop forever
+        // Try current source; on failure, advance through the remaining sources
+        result = await tryWith(activeSource());
+        while (!result.success && sourceIdx < sources.length - 1) {
+            sourceIdx++;
+            result = await tryWith(activeSource());
         }
 
-        // Phase 2: cookies/browser fallback (only if proxy pool fully exhausted)
-        if (!result?.success && !stopReason) {
-            for (const source of cookieList) {
-                result = await tryWith(source);
-                if (result.success) break;
-            }
-        }
-
-        if (result?.success) {
+        if (result.success) {
             completed++;
             sessionBytes += result.bytes || 0;
             console.log(`Progress: ${completed}/${total} videos completed.`);
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
-        } else if (!stopReason) {
-            // All sources exhausted for this video — flag the run to stop;
-            // other in-flight workers finish their current video then exit.
-            // Edit the per-video message to the final stop notice (one message per video).
+
+            const hasMore = playlistData.slice(i + 1).some(v => !(v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')));
+            if (hasMore) {
+                // Random 2–6 min delay between videos to avoid YouTube bot detection
+                const delaySec = Math.floor(Math.random() * (360 - 120 + 1)) + 120;
+                console.log(`\n⏱️  Waiting ${(delaySec / 60).toFixed(1)} min before next download...`);
+                await new Promise(r => setTimeout(r, delaySec * 1000));
+            }
+        } else {
+            // All sources exhausted — stop entirely. Use the per-video message for the stop notice.
             sessionFailures++;
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
             const failedTitle = video.lessonTitle || video.videoId || 'לא ידוע';
             const sessionDur = formatDuration(Math.round((Date.now() - sessionStart) / 1000));
             const stopText =
                 `❌ *youtube-to-bunny נעצרה!*\n` +
-                `🎬 [${globalIdx + 1}/${total}] ${failedTitle}\n` +
-                `🔁 נכשל על כל הפרוקסיים שנוסו + ${cookieList.length} fallback(s)\n` +
+                `🎬 [${i + 1}/${total}] ${failedTitle}\n` +
+                `🔁 נכשל עם כל ${sources.length} המקורות (ישיר + ${cookieCount} cookies)\n` +
                 `📊 הושלמו ${completed}/${total} (${completed - startedAt} בסשן זה)\n` +
                 `⏱️ זמן ריצה: ${sessionDur}\n` +
                 `🕐 ${nowHHMM()}`;
             if (liveId) await editTelegramMessage(liveId, stopText);
             else await sendTelegram(stopText);
-            stopReason = `Video failed on all auth sources: ${failedTitle}`;
+            throw new Error(`Video failed on all auth sources: ${failedTitle}`);
         }
-    };
-
-    const worker = async (workerId) => {
-        while (!stopReason) {
-            const myIdx = cursor++;
-            if (myIdx >= todo.length) return;
-            const { video, globalIdx } = todo[myIdx];
-            console.log(`\n[Worker ${workerId}] Picking up [${globalIdx + 1}/${total}]: ${video.lessonTitle || video.videoId}`);
-            await processOneVideo(video, globalIdx);
-        }
-    };
-
-    const workers = [];
-    for (let w = 0; w < MAX_PARALLEL; w++) workers.push(worker(w + 1));
-    await Promise.all(workers);
-
-    if (stopReason) throw new Error(stopReason);
+    }
 
     fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
     console.log('\nSync complete and updated file saved successfully!');
