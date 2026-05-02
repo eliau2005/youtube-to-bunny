@@ -160,8 +160,8 @@ function sleepWithCountdown(totalSeconds, completed, total, liveId = null, lastD
     return new Promise((resolve) => {
         const startedAt = Date.now();
         const totalMinStr = (totalSeconds / 60).toFixed(1);
-        const TICK_MS = 100;
-        const TG_THROTTLE_MS = 100; // Telegram will 429-drop excess silently
+        const TICK_MS = 1000;        // console refresh once a second is plenty
+        const TG_THROTTLE_MS = 10000; // Telegram countdown: every 10 sec
         let lastTgEdit = 0;
 
         const fmtTime = (s) => {
@@ -422,10 +422,8 @@ async function processVideo(videoObj, cookieArgs, ctx) {
     // ── Live Telegram progress message ─────────────────────────────────────
     let liveId = null;
     let lastEditAt = 0;
-    // Telegram caps editMessageText at ~1/sec per message; excess hits 429 and
-    // is dropped silently by editTelegramMessage. 100ms is the requested cadence.
-    const DL_THROTTLE_MS  = 100;
-    const UPL_THROTTLE_MS = 100;
+    const DL_THROTTLE_MS  = 2000; // download/upload progress: every 2 sec
+    const UPL_THROTTLE_MS = 2000;
 
     const initLive = async (text) => {
         const msg = await sendTelegramMessage(text);
