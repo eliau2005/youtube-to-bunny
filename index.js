@@ -276,8 +276,8 @@ function listFormats(youtubeUrl, cookieArgs) {
         const args = [
             ...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node',
             '--no-check-certificate',
-            // Fast-fail when proxy is bad: don't internally retry (let the rotation try the next one)
-            '--retries', '1', '--extractor-retries', '1', '--socket-timeout', '15',
+            // Increase timeout and retries for slow proxies
+            '--retries', '3', '--extractor-retries', '3', '--socket-timeout', '30',
             youtubeUrl
         ];
         const child = spawn('yt-dlp', args, { shell: process.platform === 'win32' });
@@ -309,6 +309,9 @@ function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs, onProgress) {
             '--no-playlist',
             '--js-runtimes', 'node',
             '--sleep-requests', '2',
+            '--retries', '5',
+            '--fragment-retries', '10',
+            '--socket-timeout', '30',
             '-f', 'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best',
             '-S', 'res:1080,fps,vcodec:h264:vp9,acodec:m4a',
             '--merge-output-format', 'mp4',
