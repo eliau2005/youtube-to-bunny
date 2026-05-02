@@ -28,6 +28,8 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 
 const COOKIES_TARGET = path.join(__dirname, 'cookies1.txt');
 const PLAYLIST_PATH = path.join(__dirname, 'playlist.json');
+const PLAYLISTS_DIR = path.join(__dirname, 'playlists');
+const STAGED_PLAYLIST = path.join(__dirname, '.playlist-pending.json');
 const INDEX_SCRIPT = path.join(__dirname, 'index.js');
 const ALLOWED_CHAT_ID = String(TELEGRAM_CHAT_ID);
 
@@ -35,6 +37,7 @@ let runningChild = null;
 let intentionalKill = false;
 let lastUpdateId = 0;
 let waitingForFilename = false; // when true, the next text message becomes the playlist filename
+let pendingPlaylistInfo = null; // { items: number, fileName: string } when a .json is awaiting confirm
 
 // ─── Telegram API helpers ────────────────────────────────────────────────────
 
@@ -194,10 +197,45 @@ async function handleUpdate(update) {
         const cq = update.callback_query;
         if (String(cq.message?.chat?.id) !== ALLOWED_CHAT_ID) return;
         await tgRequest('answerCallbackQuery', { callback_query_id: cq.id });
+
         if (cq.data === 'restart') {
             await sendMessage('🔄 מפעיל מחדש...');
             await restartScript();
             await sendMessage('🚀 הופעל מחדש.');
+            return;
+        }
+
+        if (cq.data === 'overwrite_playlist') {
+            if (!pendingPlaylistInfo || !fs.existsSync(STAGED_PLAYLIST)) {
+                await sendMessage('אין פלייליסט ממתין להחלפה.');
+                return;
+            }
+            if (runningChild) {
+                await sendMessage('⚠️ ריצה פעילה — שלח /stop לפני החלפת פלייליסט.');
+                return;
+            }
+            try {
+                fs.copyFileSync(STAGED_PLAYLIST, PLAYLIST_PATH);
+                fs.unlinkSync(STAGED_PLAYLIST);
+                const info = pendingPlaylistInfo;
+                pendingPlaylistInfo = null;
+                await sendMessage(
+                    `✅ פלייליסט חדש נטען (${info.items} סרטונים).\nלחץ Restart כדי להתחיל ריצה חדשה.`,
+                    { reply_markup: restartButton }
+                );
+            } catch (e) {
+                await sendMessage(`❌ דריסה נכשלה: \`${e.message}\``);
+            }
+            return;
+        }
+
+        if (cq.data === 'cancel_playlist') {
+            if (fs.existsSync(STAGED_PLAYLIST)) {
+                try { fs.unlinkSync(STAGED_PLAYLIST); } catch (_) {}
+            }
+            pendingPlaylistInfo = null;
+            await sendMessage('בוטל. הפלייליסט הקיים נשאר ללא שינוי.');
+            return;
         }
         return;
     }
@@ -205,27 +243,65 @@ async function handleUpdate(update) {
     const msg = update.message;
     if (!msg || String(msg.chat?.id) !== ALLOWED_CHAT_ID) return;
 
-    // Document upload (cookies file)
+    // Document upload — route by extension: .txt → cookies; .json → playlist (with confirmation)
     if (msg.document) {
         const doc = msg.document;
         const fileName = doc.file_name || 'unknown';
-        if (!fileName.toLowerCase().endsWith('.txt')) {
-            await sendMessage(`קובץ "${fileName}" לא .txt — מתעלם.`);
+        const lower = fileName.toLowerCase();
+
+        if (lower.endsWith('.txt')) {
+            await sendMessage(`📥 מקבל "${fileName}" כ-cookies...`);
+            try {
+                const fileInfo = await tgRequest('getFile', { file_id: doc.file_id });
+                if (!fileInfo.ok) throw new Error('getFile failed');
+                await downloadFile(fileInfo.result.file_path, COOKIES_TARGET);
+                const stats = fs.statSync(COOKIES_TARGET);
+                await sendMessage(
+                    `✅ נשמר כ-\`cookies1.txt\` (${stats.size} bytes).\nלחץ Restart כדי להפעיל מחדש.`,
+                    { reply_markup: restartButton }
+                );
+            } catch (e) {
+                await sendMessage(`❌ שמירה נכשלה: \`${e.message}\``);
+            }
             return;
         }
-        await sendMessage(`📥 מקבל "${fileName}"...`);
-        try {
-            const fileInfo = await tgRequest('getFile', { file_id: doc.file_id });
-            if (!fileInfo.ok) throw new Error('getFile failed');
-            await downloadFile(fileInfo.result.file_path, COOKIES_TARGET);
-            const stats = fs.statSync(COOKIES_TARGET);
-            await sendMessage(
-                `✅ נשמר כ-\`cookies1.txt\` (${stats.size} bytes).\nלחץ Restart כדי להפעיל מחדש.`,
-                { reply_markup: restartButton }
-            );
-        } catch (e) {
-            await sendMessage(`❌ שמירה נכשלה: \`${e.message}\``);
+
+        if (lower.endsWith('.json')) {
+            await sendMessage(`📥 מקבל "${fileName}" כפלייליסט חדש...`);
+            try {
+                const fileInfo = await tgRequest('getFile', { file_id: doc.file_id });
+                if (!fileInfo.ok) throw new Error('getFile failed');
+                await downloadFile(fileInfo.result.file_path, STAGED_PLAYLIST);
+                // Validate it's a JSON array
+                let items;
+                try {
+                    const parsed = JSON.parse(fs.readFileSync(STAGED_PLAYLIST, 'utf8'));
+                    if (!Array.isArray(parsed)) throw new Error('not an array');
+                    items = parsed.length;
+                } catch (parseErr) {
+                    if (fs.existsSync(STAGED_PLAYLIST)) fs.unlinkSync(STAGED_PLAYLIST);
+                    throw new Error(`לא JSON תקין: ${parseErr.message}`);
+                }
+                pendingPlaylistInfo = { items, fileName };
+                await sendMessage(
+                    `📋 *פלייליסט חדש מוכן:* \`${fileName}\` (${items} סרטונים)\n` +
+                    `*אתה בטוח שאתה רוצה לדרוס את הפלייליסט הקיים?*`,
+                    {
+                        reply_markup: {
+                            inline_keyboard: [[
+                                { text: '✅ כן, דרוס', callback_data: 'overwrite_playlist' },
+                                { text: '❌ ביטול', callback_data: 'cancel_playlist' }
+                            ]]
+                        }
+                    }
+                );
+            } catch (e) {
+                await sendMessage(`❌ קליטת פלייליסט נכשלה: \`${e.message}\``);
+            }
+            return;
         }
+
+        await sendMessage(`קובץ "${fileName}" — מתעלם (קבל רק .txt או .json).`);
         return;
     }
 
@@ -242,8 +318,23 @@ async function handleUpdate(update) {
             return;
         }
         const finalName = safe.toLowerCase().endsWith('.json') ? safe : safe + '.json';
+
+        // Archive a copy under playlists/ on the server (creates dir if missing)
+        let archived = false;
+        let archiveErr = null;
+        try {
+            if (!fs.existsSync(PLAYLISTS_DIR)) fs.mkdirSync(PLAYLISTS_DIR, { recursive: true });
+            fs.copyFileSync(PLAYLIST_PATH, path.join(PLAYLISTS_DIR, finalName));
+            archived = true;
+        } catch (e) {
+            archiveErr = e.message;
+        }
+
         await sendMessage(`📤 שולח כ-\`${finalName}\`...`);
-        const r = await sendDocument(PLAYLIST_PATH, finalName, `playlist (${finalName})`);
+        const caption = archived
+            ? `playlist (${finalName}) — נשמר גם ב-playlists/`
+            : `playlist (${finalName}) — ⚠️ ארכוב נכשל: ${archiveErr}`;
+        const r = await sendDocument(PLAYLIST_PATH, finalName, caption);
         if (!r.ok) await sendMessage(`❌ שליחה נכשלה: \`${r.error || 'unknown'}\``);
         return;
     }
