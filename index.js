@@ -433,9 +433,11 @@ async function processVideo(videoObj, cookieArgs, ctx) {
 
         console.log('Downloading from YouTube at maximum quality...');
         const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
-        if (maxRes > 0 && maxRes < 720) {
-            console.warn(`⚠️  WARNING: YouTube is only offering ${maxRes}p - cookies may be expired or invalid!`);
-            await sendTelegram(`⚠️ *אזהרה:* YouTube מציע רק ${maxRes}p — ייתכן שה-cookies פגי תוקף.`);
+        if (maxRes > 0 && maxRes < 1080) {
+            // Force rotation to next source — anonymous access is often capped at 360p,
+            // cookies usually unlock 1080p. The error propagates to run()'s loop which
+            // moves to the next source.
+            throw new Error(`Source only offers ${maxRes}p — need 1080p`);
         }
 
         const downloadStart = Date.now();
