@@ -272,7 +272,7 @@ function createProxyPool() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function listFormats(youtubeUrl, cookieArgs) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const args = [
             ...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node',
             '--no-check-certificate',
@@ -282,12 +282,21 @@ function listFormats(youtubeUrl, cookieArgs) {
         ];
         const child = spawn('yt-dlp', args, { shell: process.platform === 'win32' });
         let output = '';
+        let stderr = '';
         child.stdout.on('data', d => output += d.toString());
-        child.stderr.on('data', d => output += d.toString());
-        child.on('close', () => {
+        child.stderr.on('data', d => stderr += d.toString());
+        child.on('close', (code) => {
+            if (code !== 0) {
+                return reject(new Error(`yt-dlp format list failed with code ${code}. ${stderr.trim().split('\n').slice(-1)}`));
+            }
             // Extract the highest resolution available
             const resolutions = [...output.matchAll(/(\d{3,4})p/g)].map(m => parseInt(m[1]));
             const maxRes = resolutions.length ? Math.max(...resolutions) : 0;
+            
+            if (maxRes === 0) {
+                return reject(new Error(`No valid formats found (max resolution 0p).`));
+            }
+
             console.log(`Available formats (max resolution found: ${maxRes}p):`);
             // Print only the resolution table lines
             const lines = output.split('\n').filter(l =>
@@ -296,7 +305,7 @@ function listFormats(youtubeUrl, cookieArgs) {
             lines.slice(0, 30).forEach(l => console.log('  ', l));
             resolve(maxRes);
         });
-        child.on('error', () => resolve(0));
+        child.on('error', (err) => reject(err));
     });
 }
 
