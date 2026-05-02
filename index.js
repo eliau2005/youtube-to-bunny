@@ -133,6 +133,37 @@ function nowHHMM() {
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
+// Sleeps `totalSec` seconds and edits the previous video's Telegram message
+// with a countdown every 15s. Restores the original doneText (no countdown) at
+// the end so the message stays clean.
+function sleepWithTelegramCountdown(totalSec, completed, total, liveId, doneText) {
+    const startedAt = Date.now();
+    const fmtTime = (s) => {
+        const m = Math.floor(s / 60);
+        return `${String(m).padStart(2, '0')}:${String(Math.floor(s) % 60).padStart(2, '0')}`;
+    };
+    const renderTg = (remaining) => {
+        if (!liveId) return;
+        const text = (doneText ? doneText + '\n\n' : '') +
+            `⏳ *הורדה הבאה עוד:* ${fmtTime(remaining)}\n` +
+            `📊 הושלמו ${completed}/${total} סרטונים`;
+        editTelegramMessage(liveId, text); // fire-and-forget
+    };
+    renderTg(totalSec); // immediate first update
+    const interval = setInterval(() => {
+        const elapsed = (Date.now() - startedAt) / 1000;
+        const remaining = totalSec - elapsed;
+        if (remaining > 0) renderTg(remaining);
+    }, 15000);
+    return new Promise((resolve) => {
+        setTimeout(() => {
+            clearInterval(interval);
+            if (liveId && doneText) editTelegramMessage(liveId, doneText); // restore clean state
+            resolve();
+        }, totalSec * 1000);
+    });
+}
+
 function renderProgressBar(label, percent, speed, eta) {
     const barWidth = 30;
     const clamped = Math.max(0, Math.min(100, percent));
@@ -638,7 +669,7 @@ async function run() {
                 // Random 2–6 min delay between videos to avoid YouTube bot detection
                 const delaySec = Math.floor(Math.random() * (360 - 120 + 1)) + 120;
                 console.log(`\n⏱️  Waiting ${(delaySec / 60).toFixed(1)} min before next download...`);
-                await new Promise(r => setTimeout(r, delaySec * 1000));
+                await sleepWithTelegramCountdown(delaySec, completed, total, result.liveId, result.doneText);
             }
         } else {
             // All sources exhausted — stop entirely. Use the per-video message for the stop notice.

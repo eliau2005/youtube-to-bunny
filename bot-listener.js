@@ -27,12 +27,14 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 
 const COOKIES_TARGET = path.join(__dirname, 'cookies1.txt');
+const PLAYLIST_PATH = path.join(__dirname, 'playlist.json');
 const INDEX_SCRIPT = path.join(__dirname, 'index.js');
 const ALLOWED_CHAT_ID = String(TELEGRAM_CHAT_ID);
 
 let runningChild = null;
 let intentionalKill = false;
 let lastUpdateId = 0;
+let waitingForFilename = false; // when true, the next text message becomes the playlist filename
 
 // ─── Telegram API helpers ────────────────────────────────────────────────────
 
@@ -84,6 +86,52 @@ function downloadFile(filePath, destPath) {
     });
 }
 
+// Uploads a local file to Telegram as a document with a custom display name.
+// The local file is NOT touched (read-only). Uses multipart/form-data, no extra deps.
+function sendDocument(localPath, displayName, caption = '') {
+    return new Promise((resolve) => {
+        if (!fs.existsSync(localPath)) return resolve({ ok: false, error: 'file missing' });
+        const boundary = '----formdata-' + Math.random().toString(36).slice(2);
+        const fileContent = fs.readFileSync(localPath);
+        const parts = [];
+        const addField = (name, value) => parts.push(
+            Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`)
+        );
+        addField('chat_id', ALLOWED_CHAT_ID);
+        if (caption) addField('caption', caption);
+        parts.push(
+            Buffer.from(
+                `--${boundary}\r\n` +
+                `Content-Disposition: form-data; name="document"; filename="${displayName}"\r\n` +
+                `Content-Type: application/octet-stream\r\n\r\n`
+            ),
+            fileContent,
+            Buffer.from(`\r\n--${boundary}--\r\n`)
+        );
+        const body = Buffer.concat(parts);
+        const req = https.request({
+            hostname: 'api.telegram.org',
+            path: `/bot${TELEGRAM_BOT_TOKEN}/sendDocument`,
+            method: 'POST',
+            headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
+            timeout: 60000
+        }, (res) => {
+            let data = '';
+            res.on('data', d => data += d.toString());
+            res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ ok: false }); } });
+        });
+        req.on('timeout', () => { req.destroy(new Error('timeout')); });
+        req.on('error', (e) => resolve({ ok: false, error: e.message }));
+        req.write(body);
+        req.end();
+    });
+}
+
+function sanitizeFilename(name) {
+    // Allow letters (Latin + Hebrew U+0590..U+05FF), digits, dot/underscore/dash.
+    return name.replace(/[^a-zA-Z0-9_\-.֐-׿]/g, '_').slice(0, 80);
+}
+
 // ─── Process management ─────────────────────────────────────────────────────
 
 function startScript() {
@@ -98,10 +146,21 @@ function startScript() {
         intentionalKill = false;
         console.log(`index.js exited (code=${code}, signal=${signal})`);
         if (wasIntentional) return; // user-triggered kill — index.js sends its own messages
-        const text = code === 0
-            ? '✅ *הריצה הסתיימה.*'
-            : `❌ *הריצה נעצרה* (exit ${code}).\nשלח קובץ \`cookies.txt\` חדש או לחץ Restart.`;
-        sendMessage(text, { reply_markup: restartButton });
+        if (code === 0) {
+            // On success: ask for a filename to send the playlist back as
+            waitingForFilename = true;
+            sendMessage(
+                '✅ *הריצה הסתיימה בהצלחה.*\n' +
+                'איזה שם לתת לקובץ הפלייליסט המעודכן? (לדוגמה: `playlist-2026-05-03`)\n' +
+                '_שלח את השם בהודעה הבאה. הקובץ ב-server לא יימחק._',
+                { reply_markup: restartButton }
+            );
+        } else {
+            sendMessage(
+                `❌ *הריצה נעצרה* (exit ${code}).\nשלח קובץ \`cookies.txt\` חדש או לחץ Restart.`,
+                { reply_markup: restartButton }
+            );
+        }
     });
 
     return { ok: true };
@@ -170,18 +229,37 @@ async function handleUpdate(update) {
         return;
     }
 
-    // Text command
+    // Text message
     const text = (msg.text || '').trim();
+    if (!text) return;
+
+    // If awaiting a filename (post-success), the next non-command message becomes the name
+    if (waitingForFilename && !text.startsWith('/')) {
+        waitingForFilename = false;
+        const safe = sanitizeFilename(text);
+        if (!safe) {
+            await sendMessage('שם לא חוקי — נסה שוב עם /restart או שלח קובץ.');
+            return;
+        }
+        const finalName = safe.toLowerCase().endsWith('.json') ? safe : safe + '.json';
+        await sendMessage(`📤 שולח כ-\`${finalName}\`...`);
+        const r = await sendDocument(PLAYLIST_PATH, finalName, `playlist (${finalName})`);
+        if (!r.ok) await sendMessage(`❌ שליחה נכשלה: \`${r.error || 'unknown'}\``);
+        return;
+    }
+
     if (!text.startsWith('/')) return;
     const cmd = text.split(/\s+/)[0].toLowerCase().split('@')[0];
 
     switch (cmd) {
         case '/start': {
+            waitingForFilename = false;
             const r = startScript();
             await sendMessage(r.ok ? '🚀 הופעל.' : 'כבר רץ.');
             break;
         }
         case '/restart': {
+            waitingForFilename = false;
             await sendMessage('🔄 מפעיל מחדש...');
             await restartScript();
             await sendMessage('🚀 הופעל מחדש.');
