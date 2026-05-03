@@ -133,32 +133,37 @@ function nowHHMM() {
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-// Sleeps `totalSec` seconds and edits the previous video's Telegram message
-// with a countdown every 15s. Restores the original doneText (no countdown) at
-// the end so the message stays clean.
-function sleepWithTelegramCountdown(totalSec, completed, total, liveId, doneText) {
+// Sleeps for totalSec seconds, editing a Telegram message with a live progress
+// bar (elapsed/total in M:SS plus seconds count and percent). When done,
+// optionally edits to `finalText` to clean up. Used for both inter-cookie waits
+// and inter-video waits.
+function sleepWithProgressBar({ totalSec, liveId, bodyTop = '', bodyBottom = '', finalText = null, tickMs = 5000 }) {
     const startedAt = Date.now();
     const fmtTime = (s) => {
         const m = Math.floor(s / 60);
         return `${String(m).padStart(2, '0')}:${String(Math.floor(s) % 60).padStart(2, '0')}`;
     };
-    const renderTg = (remaining) => {
+    const render = (remaining) => {
         if (!liveId) return;
-        const text = (doneText ? doneText + '\n\n' : '') +
-            `⏳ *הורדה הבאה עוד:* ${fmtTime(remaining)}\n` +
-            `📊 הושלמו ${completed}/${total} סרטונים`;
+        const elapsed = totalSec - remaining;
+        const pct = Math.max(0, Math.min(100, (elapsed / totalSec) * 100));
+        const text =
+            (bodyTop ? bodyTop + '\n' : '') +
+            `⏳ ${fmtTime(elapsed)} / ${fmtTime(totalSec)}  (${Math.floor(elapsed)}s / ${totalSec}s)\n` +
+            `\`${telegramBar(pct)}\` ${pct.toFixed(0)}%` +
+            (bodyBottom ? '\n' + bodyBottom : '');
         editTelegramMessage(liveId, text); // fire-and-forget
     };
-    renderTg(totalSec); // immediate first update
+    render(totalSec); // immediate render at 0%
     const interval = setInterval(() => {
         const elapsed = (Date.now() - startedAt) / 1000;
         const remaining = totalSec - elapsed;
-        if (remaining > 0) renderTg(remaining);
-    }, 15000);
+        if (remaining > 0) render(remaining);
+    }, tickMs);
     return new Promise((resolve) => {
         setTimeout(() => {
             clearInterval(interval);
-            if (liveId && doneText) editTelegramMessage(liveId, doneText); // restore clean state
+            if (liveId && finalText !== null) editTelegramMessage(liveId, finalText);
             resolve();
         }, totalSec * 1000);
     });
@@ -232,7 +237,7 @@ function getCookieFiles() {
 }
 
 function buildAuthSources() {
-    const sources = [{ type: 'direct', value: null, label: 'no-auth' }];
+    const sources = [];
     for (const file of getCookieFiles()) {
         sources.push({ type: 'cookie', value: file, label: path.basename(file) });
     }
@@ -578,15 +583,20 @@ async function run() {
     console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
 
     // ── Auth source rotation setup ──────────────────────────────────────────
-    // direct first; on failure rotate cookies1 → cookies2 → cookies3 → plain.
-    // The active source is sticky: stays on whichever last worked, advances
-    // only when it fails for a video.
+    // Sticky cookie rotation: cookies1.txt → cookies2.txt → cookies3.txt.
+    // Active source stays on whichever last worked; advances only on failure.
     const sources = buildAuthSources();
+    if (sources.length === 0) {
+        const msg = 'No cookie files found (expected cookies1.txt / cookies2.txt / cookies3.txt). Aborting.';
+        console.error(msg);
+        await sendTelegram(`❌ *אין קבצי cookies*\nהעלה לפחות \`cookies1.txt\` (שלח את הקובץ בטלגרם או הנח על השרת) ואז Restart.`);
+        throw new Error(msg);
+    }
     let sourceIdx = 0;
     const activeSource = () => sources[sourceIdx];
-    const cookieCount = sources.filter(s => s.type === 'cookie').length;
-    console.log(`Auth sources: direct + ${cookieCount} cookie file(s)`);
-    console.log(`Order: ${sources.map(s => `${s.type}:${s.label}`).join(' → ')}`);
+    const cookieCount = sources.length;
+    console.log(`Auth sources: ${cookieCount} cookie file(s)`);
+    console.log(`Order: ${sources.map(s => s.label).join(' → ')}`);
 
     await loadCollections();
 
@@ -601,7 +611,7 @@ async function run() {
         `📊 סה״כ בפלייליסט: ${total}\n` +
         `✅ כבר הועלו: ${completed}\n` +
         `⏳ נותרו לעיבוד: ${remaining}\n` +
-        `🌐 ישיר + 🍪 ${cookieCount} cookies fallback`
+        `🍪 ${cookieCount} cookies (לפי סדר): ${sources.map(s => s.label).join(' → ')}`
     );
 
     for (let i = 0; i < playlistData.length; i++) {
@@ -631,14 +641,15 @@ async function run() {
             if (attempt > 1) {
                 const nextHeb = source.type === 'cookie' ? 'Cookie' : 'ישיר';
                 console.log(`\n🔄 Switching to ${source.type}:${source.label} (attempt ${attempt}) — waiting 30s...`);
-                if (liveId) {
-                    await editTelegramMessage(liveId,
+                await sleepWithProgressBar({
+                    totalSec: 30,
+                    liveId,
+                    bodyTop:
                         `🎬 *[${i + 1}/${total}]* ${title}\n` +
                         `🔄 *מחליף ל-${nextHeb}: ${source.label}*\n` +
-                        `🔁 ניסיון ${attempt} — המתנה 30 שנ׳`
-                    );
-                }
-                await new Promise(r => setTimeout(r, 30 * 1000));
+                        `🔁 ניסיון ${attempt}`,
+                    tickMs: 5000
+                });
             }
             return await processVideo(video, buildYtdlpAuthArgs(source), {
                 videoIndex: i + 1,
@@ -669,7 +680,13 @@ async function run() {
                 // Random 2–6 min delay between videos to avoid YouTube bot detection
                 const delaySec = Math.floor(Math.random() * (360 - 120 + 1)) + 120;
                 console.log(`\n⏱️  Waiting ${(delaySec / 60).toFixed(1)} min before next download...`);
-                await sleepWithTelegramCountdown(delaySec, completed, total, result.liveId, result.doneText);
+                await sleepWithProgressBar({
+                    totalSec: delaySec,
+                    liveId: result.liveId,
+                    bodyTop: result.doneText + '\n\n⏳ *המתנה לסרטון הבא:*',
+                    finalText: result.doneText, // restore clean state at end
+                    tickMs: 15000
+                });
             }
         } else {
             // All sources exhausted — stop entirely. Use the per-video message for the stop notice.
@@ -680,7 +697,7 @@ async function run() {
             const stopText =
                 `❌ *youtube-to-bunny נעצרה!*\n` +
                 `🎬 [${i + 1}/${total}] ${failedTitle}\n` +
-                `🔁 נכשל עם כל ${sources.length} המקורות (ישיר + ${cookieCount} cookies)\n` +
+                `🔁 נכשל עם כל ${cookieCount} קבצי ה-cookies\n` +
                 `📊 הושלמו ${completed}/${total} (${completed - startedAt} בסשן זה)\n` +
                 `⏱️ זמן ריצה: ${sessionDur}\n` +
                 `🕐 ${nowHHMM()}`;
