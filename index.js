@@ -18,10 +18,12 @@ const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = process.env;
 // ─── Telegram Helpers ────────────────────────────────────────────────────────
 
 // Sends a new message; resolves with the Telegram Message object (contains .message_id) or null
-function sendTelegramMessage(text) {
+function sendTelegramMessage(text, replyMarkup = null) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return Promise.resolve(null);
     return new Promise((resolve) => {
-        const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' });
+        const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' };
+        if (replyMarkup) payload.reply_markup = replyMarkup;
+        const body = JSON.stringify(payload);
         const req = https.request({
             hostname: 'api.telegram.org',
             path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -48,11 +50,13 @@ let tgBackoffUntil = 0;
 let tgBackoffWarned = false;
 
 // Edits an existing message in-place; handles Telegram 429 rate-limit gracefully
-function editTelegramMessage(messageId, text) {
+function editTelegramMessage(messageId, text, replyMarkup = null) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !messageId) return Promise.resolve();
     if (Date.now() < tgBackoffUntil) return Promise.resolve(); // in backoff — skip silently
     return new Promise((resolve) => {
-        const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, message_id: messageId, text, parse_mode: 'Markdown' });
+        const payload = { chat_id: TELEGRAM_CHAT_ID, message_id: messageId, text, parse_mode: 'Markdown' };
+        if (replyMarkup) payload.reply_markup = replyMarkup;
+        const body = JSON.stringify(payload);
         const req = https.request({
             hostname: 'api.telegram.org',
             path: `/bot${TELEGRAM_BOT_TOKEN}/editMessageText`,
@@ -131,6 +135,45 @@ function formatDuration(seconds) {
 function nowHHMM() {
     const d = new Date();
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+// Asks the user (via Telegram inline buttons) whether to download a sub-1080p
+// video at its current quality or rotate cookies. Bot-listener catches the
+// callback_query and writes `.choice-{id}.json` with the answer; we poll for it.
+// Falls back to 'rotate' on timeout (5 min) — safe default that triggers rotation.
+async function askUserQualityChoice({ liveId, videoIndex, total, title, maxRes }) {
+    const requestId = `${videoIndex}_${Date.now()}`;
+    const choiceFile = path.join(__dirname, `.choice-${requestId}.json`);
+    const promptText =
+        `🎬 *[${videoIndex}/${total}]* ${title}\n\n` +
+        `⚠️ *הסרטון הזה מציע מקסימום ${maxRes}p* (לא 1080p)\n` +
+        `הסיבה כנראה הסרטון עצמו, לא ה-cookies. מה לעשות?`;
+    const buttons = {
+        inline_keyboard: [[
+            { text: `✅ הורד ב-${maxRes}p`, callback_data: `quality:${requestId}:continue` },
+            { text: '🔄 החלף Cookies', callback_data: `quality:${requestId}:rotate` }
+        ]]
+    };
+    if (liveId) await editTelegramMessage(liveId, promptText, buttons);
+    else await sendTelegramMessage(promptText, buttons);
+
+    console.warn(`\n⚠️  Video offers max ${maxRes}p. Awaiting choice in Telegram (request ${requestId}). 5-min timeout → 'rotate'.`);
+
+    const startedAt = Date.now();
+    const TIMEOUT_MS = 5 * 60 * 1000;
+    while (Date.now() - startedAt < TIMEOUT_MS) {
+        if (fs.existsSync(choiceFile)) {
+            try {
+                const choice = JSON.parse(fs.readFileSync(choiceFile, 'utf8'));
+                fs.unlinkSync(choiceFile);
+                console.log(`Choice received: ${choice.answer}`);
+                return choice.answer; // 'continue' or 'rotate'
+            } catch (_) { /* malformed file — ignore and keep polling */ }
+        }
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    console.warn('Timed out waiting for quality choice. Defaulting to rotate.');
+    return 'rotate';
 }
 
 // Sleeps for totalSec seconds, editing a Telegram message with a live progress
@@ -470,10 +513,16 @@ async function processVideo(videoObj, cookieArgs, ctx) {
         console.log('Downloading from YouTube at maximum quality...');
         const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
         if (maxRes > 0 && maxRes < 1080) {
-            // Force rotation to next source — anonymous access is often capped at 360p,
-            // cookies usually unlock 1080p. The error propagates to run()'s loop which
-            // moves to the next source.
-            throw new Error(`Source only offers ${maxRes}p — need 1080p`);
+            // Could be either: (a) cookies session is degraded, or (b) the video itself
+            // was uploaded below 1080p. Ask the user via Telegram which it is.
+            const choice = await askUserQualityChoice({
+                liveId, videoIndex, total, title, maxRes
+            });
+            if (choice === 'rotate') {
+                throw new Error(`User chose to rotate — source offers only ${maxRes}p`);
+            }
+            // 'continue' → fall through and download at the available quality
+            console.log(`User chose to continue at ${maxRes}p.`);
         }
 
         const downloadStart = Date.now();

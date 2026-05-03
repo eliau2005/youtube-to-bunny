@@ -237,6 +237,28 @@ async function handleUpdate(update) {
             await sendMessage('בוטל. הפלייליסט הקיים נשאר ללא שינוי.');
             return;
         }
+
+        // Quality choice from index.js: callback_data format `quality:{requestId}:{continue|rotate}`
+        if (cq.data.startsWith('quality:')) {
+            const parts = cq.data.split(':');
+            const requestId = parts[1];
+            const answer = parts[2];
+            if (!requestId || (answer !== 'continue' && answer !== 'rotate')) return;
+            const choiceFile = path.join(__dirname, `.choice-${requestId}.json`);
+            try {
+                fs.writeFileSync(choiceFile, JSON.stringify({ answer }));
+            } catch (e) {
+                await sendMessage(`❌ כשלון בכתיבת תשובה: \`${e.message}\``);
+                return;
+            }
+            // Clear the inline buttons so they can't be clicked again
+            await tgRequest('editMessageReplyMarkup', {
+                chat_id: cq.message.chat.id,
+                message_id: cq.message.message_id,
+                reply_markup: { inline_keyboard: [] }
+            });
+            return;
+        }
         return;
     }
 
