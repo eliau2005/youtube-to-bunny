@@ -137,30 +137,28 @@ function nowHHMM() {
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-// Asks the user (via Telegram inline buttons) whether to download a sub-1080p
-// video at its current quality or rotate cookies. Bot-listener catches the
-// callback_query and writes `.choice-{id}.json` with the answer; we poll for it.
-// Falls back to 'rotate' on timeout (5 min) — safe default that triggers rotation.
+// Notifies the user (Telegram + terminal) that a video is below 1080p and gives
+// them 10 seconds to press "Switch Cookies"; otherwise auto-continues at the
+// available quality. Bot-listener writes `.choice-{id}.json` on click; we poll.
 async function askUserQualityChoice({ liveId, videoIndex, total, title, maxRes }) {
     const requestId = `${videoIndex}_${Date.now()}`;
     const choiceFile = path.join(__dirname, `.choice-${requestId}.json`);
     const promptText =
         `🎬 *[${videoIndex}/${total}]* ${title}\n\n` +
-        `⚠️ *הסרטון הזה מציע מקסימום ${maxRes}p* (לא 1080p)\n` +
-        `הסיבה כנראה הסרטון עצמו, לא ה-cookies. מה לעשות?`;
+        `⚠️ *הסרטון מציע מקסימום ${maxRes}p* (לא 1080p)\n` +
+        `אם לא תלחץ תוך 10 שנ׳ — מוריד אוטומטית ב-${maxRes}p.`;
     const buttons = {
         inline_keyboard: [[
-            { text: `✅ הורד ב-${maxRes}p`, callback_data: `quality:${requestId}:continue` },
             { text: '🔄 החלף Cookies', callback_data: `quality:${requestId}:rotate` }
         ]]
     };
     if (liveId) await editTelegramMessage(liveId, promptText, buttons);
     else await sendTelegramMessage(promptText, buttons);
 
-    console.warn(`\n⚠️  Video offers max ${maxRes}p. Awaiting choice in Telegram (request ${requestId}). 5-min timeout → 'rotate'.`);
+    console.warn(`\n⚠️  Video offers max ${maxRes}p. 10-sec window for "Switch Cookies"; auto-continue otherwise.`);
 
     const startedAt = Date.now();
-    const TIMEOUT_MS = 5 * 60 * 1000;
+    const TIMEOUT_MS = 10 * 1000;
     while (Date.now() - startedAt < TIMEOUT_MS) {
         if (fs.existsSync(choiceFile)) {
             try {
@@ -170,10 +168,10 @@ async function askUserQualityChoice({ liveId, videoIndex, total, title, maxRes }
                 return choice.answer; // 'continue' or 'rotate'
             } catch (_) { /* malformed file — ignore and keep polling */ }
         }
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 500));
     }
-    console.warn('Timed out waiting for quality choice. Defaulting to rotate.');
-    return 'rotate';
+    console.log('No response within 10s — auto-continuing at available quality.');
+    return 'continue';
 }
 
 // Sleeps for totalSec seconds, editing a Telegram message with a live progress
@@ -590,9 +588,12 @@ async function processVideo(videoObj, cookieArgs, ctx) {
         const completedAfter = completed + 1;
         const overallPctAfter = total > 0 ? Math.round((completedAfter / total) * 100) : 0;
 
+        // Quality actually downloaded: capped at 1080p by the format selector.
+        const downloadedRes = maxRes > 0 ? Math.min(maxRes, 1080) : null;
+        const qualityTag = downloadedRes ? ` | 📺 ${downloadedRes}p` : '';
         doneText =
             `✅ *הושלם [${videoIndex}/${total}]:* ${title}\n` +
-            `📥 הורדה ✅ ${dlDurationStr} | ${fileSize}\n` +
+            `📥 הורדה ✅ ${dlDurationStr} | ${fileSize}${qualityTag}\n` +
             `☁️ העלאה ✅ ${ulDurationStr}\n` +
             `⏱️ זמן כולל: ${totalDur}\n` +
             `📊 סה״כ הושלמו: ${completedAfter}/${total} (${overallPctAfter}%)`;
