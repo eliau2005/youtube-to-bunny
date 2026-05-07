@@ -15,11 +15,35 @@ const headers = {
 
 const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = process.env;
 
+// Shared with bot-listener.js: presence of this file = "no-wait mode" is on
+// (inter-video delay → 10s instead of random 2-6 min).
+const NO_WAIT_FLAG = path.join(__dirname, '.no-wait-mode');
+function isNoWaitMode() { return fs.existsSync(NO_WAIT_FLAG); }
+
+// Standard 3-button row appended to every Telegram message we send/edit.
+// Pass `extraTopRow` for context-specific buttons (e.g. quality "Switch Cookies").
+function controlButtons(extraTopRow = null) {
+    const noWaitOn = isNoWaitMode();
+    const toggleBtn = noWaitOn
+        ? { text: '⏸️ הפעל המתנה', callback_data: 'set_wait:on' }
+        : { text: '⚡ ללא המתנה', callback_data: 'set_wait:off' };
+    const controlsRow = [
+        { text: '🛑 Stop', callback_data: 'stop' },
+        { text: '🔄 Restart', callback_data: 'restart' },
+        toggleBtn
+    ];
+    const inline_keyboard = [];
+    if (extraTopRow) inline_keyboard.push(extraTopRow);
+    inline_keyboard.push(controlsRow);
+    return { inline_keyboard };
+}
+
 // ─── Telegram Helpers ────────────────────────────────────────────────────────
 
 // Sends a new message; resolves with the Telegram Message object (contains .message_id) or null
 function sendTelegramMessage(text, replyMarkup = null) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return Promise.resolve(null);
+    if (replyMarkup === null) replyMarkup = controlButtons(); // default: standard control buttons
     return new Promise((resolve) => {
         const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' };
         if (replyMarkup) payload.reply_markup = replyMarkup;
@@ -53,6 +77,7 @@ let tgBackoffWarned = false;
 function editTelegramMessage(messageId, text, replyMarkup = null) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !messageId) return Promise.resolve();
     if (Date.now() < tgBackoffUntil) return Promise.resolve(); // in backoff — skip silently
+    if (replyMarkup === null) replyMarkup = controlButtons(); // default: standard control buttons
     return new Promise((resolve) => {
         const payload = { chat_id: TELEGRAM_CHAT_ID, message_id: messageId, text, parse_mode: 'Markdown' };
         if (replyMarkup) payload.reply_markup = replyMarkup;
@@ -147,11 +172,9 @@ async function askUserQualityChoice({ liveId, videoIndex, total, title, maxRes }
         `🎬 *[${videoIndex}/${total}]* ${title}\n\n` +
         `⚠️ *הסרטון מציע מקסימום ${maxRes}p* (לא 1080p)\n` +
         `אם לא תלחץ תוך 10 שנ׳ — מוריד אוטומטית ב-${maxRes}p.`;
-    const buttons = {
-        inline_keyboard: [[
-            { text: '🔄 החלף Cookies', callback_data: `quality:${requestId}:rotate` }
-        ]]
-    };
+    const buttons = controlButtons([
+        { text: '🔄 החלף Cookies', callback_data: `quality:${requestId}:rotate` }
+    ]);
     if (liveId) await editTelegramMessage(liveId, promptText, buttons);
     else await sendTelegramMessage(promptText, buttons);
 
@@ -727,9 +750,10 @@ async function run() {
 
             const hasMore = playlistData.slice(i + 1).some(v => !(v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')));
             if (hasMore) {
-                // Random 2–6 min delay between videos to avoid YouTube bot detection
-                const delaySec = Math.floor(Math.random() * (360 - 120 + 1)) + 120;
-                console.log(`\n⏱️  Waiting ${(delaySec / 60).toFixed(1)} min before next download...`);
+                // Random 2–6 min anti-bot delay; 10s when no-wait mode is on (toggled via Telegram)
+                const noWait = isNoWaitMode();
+                const delaySec = noWait ? 10 : Math.floor(Math.random() * (360 - 120 + 1)) + 120;
+                console.log(`\n⏱️  Waiting ${noWait ? '10s (no-wait mode)' : (delaySec / 60).toFixed(1) + ' min'} before next download...`);
                 await sleepWithProgressBar({
                     totalSec: delaySec,
                     liveId: result.liveId,

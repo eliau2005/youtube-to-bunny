@@ -32,6 +32,26 @@ const PLAYLISTS_DIR = path.join(__dirname, 'playlists');
 const STAGED_PLAYLIST = path.join(__dirname, '.playlist-pending.json');
 const INDEX_SCRIPT = path.join(__dirname, 'index.js');
 const ALLOWED_CHAT_ID = String(TELEGRAM_CHAT_ID);
+// Shared with index.js: presence = "no-wait mode" (10s instead of 2-6 min between videos)
+const NO_WAIT_FLAG = path.join(__dirname, '.no-wait-mode');
+
+function isNoWaitMode() { return fs.existsSync(NO_WAIT_FLAG); }
+
+function controlButtons(extraTopRow = null) {
+    const noWaitOn = isNoWaitMode();
+    const toggleBtn = noWaitOn
+        ? { text: '⏸️ הפעל המתנה', callback_data: 'set_wait:on' }
+        : { text: '⚡ ללא המתנה', callback_data: 'set_wait:off' };
+    const controlsRow = [
+        { text: '🛑 Stop', callback_data: 'stop' },
+        { text: '🔄 Restart', callback_data: 'restart' },
+        toggleBtn
+    ];
+    const inline_keyboard = [];
+    if (extraTopRow) inline_keyboard.push(extraTopRow);
+    inline_keyboard.push(controlsRow);
+    return { inline_keyboard };
+}
 
 let runningChild = null;
 let intentionalKill = false;
@@ -65,15 +85,15 @@ function tgRequest(method, params = {}, timeoutMs = 60000) {
     });
 }
 
-const restartButton = { inline_keyboard: [[{ text: '🔄 Restart', callback_data: 'restart' }]] };
-
 function sendMessage(text, opts = {}) {
-    return tgRequest('sendMessage', {
+    const params = {
         chat_id: ALLOWED_CHAT_ID,
         text,
         parse_mode: 'Markdown',
         ...opts
-    });
+    };
+    if (params.reply_markup === undefined) params.reply_markup = controlButtons();
+    return tgRequest('sendMessage', params);
 }
 
 function downloadFile(filePath, destPath) {
@@ -155,13 +175,11 @@ function startScript() {
             sendMessage(
                 '✅ *הריצה הסתיימה בהצלחה.*\n' +
                 'איזה שם לתת לקובץ הפלייליסט המעודכן? (לדוגמה: `playlist-2026-05-03`)\n' +
-                '_שלח את השם בהודעה הבאה. הקובץ ב-server לא יימחק._',
-                { reply_markup: restartButton }
+                '_שלח את השם בהודעה הבאה. הקובץ ב-server לא יימחק._'
             );
         } else {
             sendMessage(
-                `❌ *הריצה נעצרה* (exit ${code}).\nשלח קובץ \`cookies.txt\` חדש או לחץ Restart.`,
-                { reply_markup: restartButton }
+                `❌ *הריצה נעצרה* (exit ${code}).\nשלח קובץ \`cookies.txt\` חדש או לחץ Restart.`
             );
         }
     });
@@ -196,6 +214,30 @@ async function handleUpdate(update) {
     if (update.callback_query) {
         const cq = update.callback_query;
         if (String(cq.message?.chat?.id) !== ALLOWED_CHAT_ID) return;
+
+        // Toggle no-wait mode (responds with toast — no extra messages)
+        if (cq.data === 'set_wait:off') {
+            try { fs.writeFileSync(NO_WAIT_FLAG, '1'); } catch (_) {}
+            await tgRequest('answerCallbackQuery', {
+                callback_query_id: cq.id, text: '⚡ מצב ללא המתנה — מופעל (10 שנ׳)'
+            });
+            return;
+        }
+        if (cq.data === 'set_wait:on') {
+            if (fs.existsSync(NO_WAIT_FLAG)) { try { fs.unlinkSync(NO_WAIT_FLAG); } catch (_) {} }
+            await tgRequest('answerCallbackQuery', {
+                callback_query_id: cq.id, text: '⏸️ המתנה בין סרטונים — מופעלת'
+            });
+            return;
+        }
+        if (cq.data === 'stop') {
+            const r = stopScript();
+            await tgRequest('answerCallbackQuery', {
+                callback_query_id: cq.id, text: r.ok ? '🛑 SIGTERM נשלח' : 'לא רץ כרגע'
+            });
+            return;
+        }
+
         await tgRequest('answerCallbackQuery', { callback_query_id: cq.id });
 
         if (cq.data === 'restart') {
@@ -220,8 +262,7 @@ async function handleUpdate(update) {
                 const info = pendingPlaylistInfo;
                 pendingPlaylistInfo = null;
                 await sendMessage(
-                    `✅ פלייליסט חדש נטען (${info.items} סרטונים).\nלחץ Restart כדי להתחיל ריצה חדשה.`,
-                    { reply_markup: restartButton }
+                    `✅ פלייליסט חדש נטען (${info.items} סרטונים).\nלחץ Restart כדי להתחיל ריצה חדשה.`
                 );
             } catch (e) {
                 await sendMessage(`❌ דריסה נכשלה: \`${e.message}\``);
@@ -279,8 +320,7 @@ async function handleUpdate(update) {
                 await downloadFile(fileInfo.result.file_path, COOKIES_TARGET);
                 const stats = fs.statSync(COOKIES_TARGET);
                 await sendMessage(
-                    `✅ נשמר כ-\`cookies1.txt\` (${stats.size} bytes).\nלחץ Restart כדי להפעיל מחדש.`,
-                    { reply_markup: restartButton }
+                    `✅ נשמר כ-\`cookies1.txt\` (${stats.size} bytes).\nלחץ Restart כדי להפעיל מחדש.`
                 );
             } catch (e) {
                 await sendMessage(`❌ שמירה נכשלה: \`${e.message}\``);
