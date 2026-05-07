@@ -34,8 +34,44 @@ const INDEX_SCRIPT = path.join(__dirname, 'index.js');
 const ALLOWED_CHAT_ID = String(TELEGRAM_CHAT_ID);
 // Shared with index.js: presence = "no-wait mode" (10s instead of 2-6 min between videos)
 const NO_WAIT_FLAG = path.join(__dirname, '.no-wait-mode');
+// Shared with index.js: id of the most recent message holding the control buttons.
+// Only one message at a time has them — preventing chat clutter.
+const ACTIVE_BUTTONS_FILE = path.join(__dirname, '.active-buttons-msg-id');
 
 function isNoWaitMode() { return fs.existsSync(NO_WAIT_FLAG); }
+
+function readActiveButtonsId() {
+    try {
+        if (fs.existsSync(ACTIVE_BUTTONS_FILE)) {
+            const id = parseInt(fs.readFileSync(ACTIVE_BUTTONS_FILE, 'utf8').trim(), 10);
+            return isNaN(id) ? null : id;
+        }
+    } catch (_) {}
+    return null;
+}
+function writeActiveButtonsId(id) {
+    try {
+        if (id) fs.writeFileSync(ACTIVE_BUTTONS_FILE, String(id));
+        else if (fs.existsSync(ACTIVE_BUTTONS_FILE)) fs.unlinkSync(ACTIVE_BUTTONS_FILE);
+    } catch (_) {}
+}
+
+function clearButtonsOnMessage(messageId) {
+    if (!messageId) return Promise.resolve();
+    return tgRequest('editMessageReplyMarkup', {
+        chat_id: ALLOWED_CHAT_ID,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: [] }
+    });
+}
+
+function makeActiveButtons(newMsgId) {
+    if (!newMsgId) return;
+    const prev = readActiveButtonsId();
+    if (prev === newMsgId) return;
+    if (prev) clearButtonsOnMessage(prev); // fire-and-forget
+    writeActiveButtonsId(newMsgId);
+}
 
 function controlButtons(extraTopRow = null) {
     const noWaitOn = isNoWaitMode();
@@ -85,7 +121,7 @@ function tgRequest(method, params = {}, timeoutMs = 60000) {
     });
 }
 
-function sendMessage(text, opts = {}) {
+async function sendMessage(text, opts = {}) {
     const params = {
         chat_id: ALLOWED_CHAT_ID,
         text,
@@ -93,7 +129,12 @@ function sendMessage(text, opts = {}) {
         ...opts
     };
     if (params.reply_markup === undefined) params.reply_markup = controlButtons();
-    return tgRequest('sendMessage', params);
+    const hasButtons = !!params.reply_markup?.inline_keyboard?.length;
+    const result = await tgRequest('sendMessage', params);
+    if (hasButtons && result?.result?.message_id) {
+        makeActiveButtons(result.result.message_id);
+    }
+    return result;
 }
 
 function downloadFile(filePath, destPath) {
@@ -292,12 +333,15 @@ async function handleUpdate(update) {
                 await sendMessage(`❌ כשלון בכתיבת תשובה: \`${e.message}\``);
                 return;
             }
-            // Clear the inline buttons so they can't be clicked again
+            // Clear the inline buttons so they can't be clicked again. Also clear
+            // the active-buttons state file if this was the active message — index.js's
+            // next progress edit will re-assign active to itself.
             await tgRequest('editMessageReplyMarkup', {
                 chat_id: cq.message.chat.id,
                 message_id: cq.message.message_id,
                 reply_markup: { inline_keyboard: [] }
             });
+            if (readActiveButtonsId() === cq.message.message_id) writeActiveButtonsId(null);
             return;
         }
         return;

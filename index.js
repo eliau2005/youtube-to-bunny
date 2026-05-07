@@ -20,6 +20,26 @@ const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = process.env;
 const NO_WAIT_FLAG = path.join(__dirname, '.no-wait-mode');
 function isNoWaitMode() { return fs.existsSync(NO_WAIT_FLAG); }
 
+// Shared with bot-listener.js: the most recent message_id that has the control
+// buttons. We keep at most one such message at any time — when a new one gets
+// buttons, we clear the old one so the chat doesn't accumulate visual clutter.
+const ACTIVE_BUTTONS_FILE = path.join(__dirname, '.active-buttons-msg-id');
+function readActiveButtonsId() {
+    try {
+        if (fs.existsSync(ACTIVE_BUTTONS_FILE)) {
+            const id = parseInt(fs.readFileSync(ACTIVE_BUTTONS_FILE, 'utf8').trim(), 10);
+            return isNaN(id) ? null : id;
+        }
+    } catch (_) {}
+    return null;
+}
+function writeActiveButtonsId(id) {
+    try {
+        if (id) fs.writeFileSync(ACTIVE_BUTTONS_FILE, String(id));
+        else if (fs.existsSync(ACTIVE_BUTTONS_FILE)) fs.unlinkSync(ACTIVE_BUTTONS_FILE);
+    } catch (_) {}
+}
+
 // Standard 3-button row appended to every Telegram message we send/edit.
 // Pass `extraTopRow` for context-specific buttons (e.g. quality "Switch Cookies").
 function controlButtons(extraTopRow = null) {
@@ -44,6 +64,7 @@ function controlButtons(extraTopRow = null) {
 function sendTelegramMessage(text, replyMarkup = null) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return Promise.resolve(null);
     if (replyMarkup === null) replyMarkup = controlButtons(); // default: standard control buttons
+    const hasButtons = !!replyMarkup?.inline_keyboard?.length;
     return new Promise((resolve) => {
         const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' };
         if (replyMarkup) payload.reply_markup = replyMarkup;
@@ -57,8 +78,11 @@ function sendTelegramMessage(text, replyMarkup = null) {
             let data = '';
             res.on('data', d => data += d.toString());
             res.on('end', () => {
-                try { resolve(JSON.parse(data).result || null); }
-                catch { resolve(null); }
+                try {
+                    const result = JSON.parse(data).result || null;
+                    if (result && hasButtons) makeActiveButtons(result.message_id);
+                    resolve(result);
+                } catch { resolve(null); }
             });
         });
         req.on('error', (e) => { console.warn('Telegram send failed:', e.message); resolve(null); });
@@ -73,11 +97,47 @@ function sendTelegramMessage(text, replyMarkup = null) {
 let tgBackoffUntil = 0;
 let tgBackoffWarned = false;
 
+// Clears the inline keyboard from a message (no text change).
+function clearButtonsOnMessage(messageId) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !messageId) return Promise.resolve();
+    if (Date.now() < tgBackoffUntil) return Promise.resolve();
+    return new Promise((resolve) => {
+        const body = JSON.stringify({
+            chat_id: TELEGRAM_CHAT_ID,
+            message_id: messageId,
+            reply_markup: { inline_keyboard: [] }
+        });
+        const req = https.request({
+            hostname: 'api.telegram.org',
+            path: `/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+        }, (res) => {
+            res.on('data', () => {});
+            res.on('end', () => resolve());
+        });
+        req.on('error', () => resolve());
+        req.write(body);
+        req.end();
+    });
+}
+
+// Marks `newMsgId` as the only message currently bearing the control buttons.
+// If a different message previously had them, clears its buttons. Idempotent.
+function makeActiveButtons(newMsgId) {
+    if (!newMsgId) return;
+    const prev = readActiveButtonsId();
+    if (prev === newMsgId) return; // already active — nothing to do
+    if (prev) clearButtonsOnMessage(prev); // fire-and-forget
+    writeActiveButtonsId(newMsgId);
+}
+
 // Edits an existing message in-place; handles Telegram 429 rate-limit gracefully
 function editTelegramMessage(messageId, text, replyMarkup = null) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !messageId) return Promise.resolve();
     if (Date.now() < tgBackoffUntil) return Promise.resolve(); // in backoff — skip silently
     if (replyMarkup === null) replyMarkup = controlButtons(); // default: standard control buttons
+    if (replyMarkup?.inline_keyboard?.length) makeActiveButtons(messageId);
     return new Promise((resolve) => {
         const payload = { chat_id: TELEGRAM_CHAT_ID, message_id: messageId, text, parse_mode: 'Markdown' };
         if (replyMarkup) payload.reply_markup = replyMarkup;
@@ -643,6 +703,10 @@ async function processVideo(videoObj, cookieArgs, ctx) {
 }
 
 async function run() {
+    // Stale active-buttons id from a previous run is no longer reachable
+    // (message id is per-chat but the prev session's UX is over) — start clean.
+    writeActiveButtonsId(null);
+
     const filePath = path.join(__dirname, 'playlist.json');
     if (!fs.existsSync(filePath)) {
         return console.error('playlist.json not found');
