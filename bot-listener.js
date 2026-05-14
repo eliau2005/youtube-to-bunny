@@ -107,7 +107,7 @@ function buildSettingsText() {
     return (
         '⚙️ *הגדרות מהירות הורדה*\n\n' +
         `🔗 חיבורי aria2c: \`${a}\`\n` +
-        `🎬 player_client: \`${p}\`\n\n` +
+        `🎬 \`player_client\`: \`${p}\`\n\n` +
         '_השינוי יחול מהסרטון הבא בריצה הנוכחית._'
     );
 }
@@ -579,7 +579,7 @@ async function handleUpdate(update) {
                 '/restart — הפעל מחדש (הורג את הריצה הנוכחית)\n' +
                 '/stop — עצור\n' +
                 '/status — סטטוס\n' +
-                '/settings — כוונון מהירות (aria2c + player_client)\n' +
+                '/settings — כוונון מהירות (aria2c + `player_client`)\n' +
                 '/help — עזרה\n\n' +
                 'גם אפשר לשלוח קובץ `.txt` ואני אשמור אותו כ-`cookies1.txt`.'
             );
