@@ -38,7 +38,35 @@ const NO_WAIT_FLAG = path.join(__dirname, '.no-wait-mode');
 // Only one message at a time has them — preventing chat clutter.
 const ACTIVE_BUTTONS_FILE = path.join(__dirname, '.active-buttons-msg-id');
 
+// Shared with index.js: download-speed tuning knobs. Plain-text files holding one
+// of the whitelisted preset values; missing/invalid → fall back to default.
+const ARIA2C_PRESET_FILE = path.join(__dirname, '.aria2c-preset');
+const PLAYER_CLIENT_FILE = path.join(__dirname, '.player-client-preset');
+const ARIA2C_PRESETS = ['6', '8', '12', '16'];
+const PLAYER_CLIENT_PRESETS = ['default', 'ios,tv', 'ios', 'tv', 'web'];
+const ARIA2C_DEFAULT = '16';
+const PLAYER_CLIENT_DEFAULT = 'default';
+
 function isNoWaitMode() { return fs.existsSync(NO_WAIT_FLAG); }
+
+function readAria2cPreset() {
+    try {
+        if (fs.existsSync(ARIA2C_PRESET_FILE)) {
+            const v = fs.readFileSync(ARIA2C_PRESET_FILE, 'utf8').trim();
+            if (ARIA2C_PRESETS.includes(v)) return v;
+        }
+    } catch (_) {}
+    return ARIA2C_DEFAULT;
+}
+function readPlayerClientPreset() {
+    try {
+        if (fs.existsSync(PLAYER_CLIENT_FILE)) {
+            const v = fs.readFileSync(PLAYER_CLIENT_FILE, 'utf8').trim();
+            if (PLAYER_CLIENT_PRESETS.includes(v)) return v;
+        }
+    } catch (_) {}
+    return PLAYER_CLIENT_DEFAULT;
+}
 
 function readActiveButtonsId() {
     try {
@@ -71,6 +99,40 @@ function makeActiveButtons(newMsgId) {
     if (prev === newMsgId) return;
     if (prev) clearButtonsOnMessage(prev); // fire-and-forget
     writeActiveButtonsId(newMsgId);
+}
+
+function buildSettingsText() {
+    const a = readAria2cPreset();
+    const p = readPlayerClientPreset();
+    return (
+        '⚙️ *הגדרות מהירות הורדה*\n\n' +
+        `🔗 חיבורי aria2c: \`${a}\`\n` +
+        `🎬 player_client: \`${p}\`\n\n` +
+        '_השינוי יחול מהסרטון הבא בריצה הנוכחית._'
+    );
+}
+
+function buildSettingsKeyboard() {
+    const a = readAria2cPreset();
+    const p = readPlayerClientPreset();
+    const aria2cRow = ARIA2C_PRESETS.map(v => ({
+        text: (v === a ? '✓ ' : '') + v,
+        callback_data: `set_aria2c:${v}`,
+    }));
+    const playerRow = PLAYER_CLIENT_PRESETS.map(v => ({
+        text: (v === p ? '✓ ' : '') + v,
+        callback_data: `set_player_client:${v}`,
+    }));
+    const noWaitOn = isNoWaitMode();
+    const toggleBtn = noWaitOn
+        ? { text: '⏸️ הפעל המתנה', callback_data: 'set_wait:on' }
+        : { text: '⚡ ללא המתנה', callback_data: 'set_wait:off' };
+    const controlsRow = [
+        { text: '🛑 Stop', callback_data: 'stop' },
+        { text: '🔄 Restart', callback_data: 'restart' },
+        toggleBtn,
+    ];
+    return { inline_keyboard: [aria2cRow, playerRow, controlsRow] };
 }
 
 function controlButtons(extraTopRow = null) {
@@ -320,6 +382,41 @@ async function handleUpdate(update) {
             return;
         }
 
+        if (cq.data.startsWith('set_aria2c:')) {
+            const v = cq.data.slice('set_aria2c:'.length);
+            if (!ARIA2C_PRESETS.includes(v)) {
+                await tgRequest('answerCallbackQuery', { callback_query_id: cq.id, text: 'ערך לא חוקי' });
+                return;
+            }
+            try { fs.writeFileSync(ARIA2C_PRESET_FILE, v); } catch (_) {}
+            await tgRequest('editMessageText', {
+                chat_id: cq.message.chat.id,
+                message_id: cq.message.message_id,
+                text: buildSettingsText(),
+                parse_mode: 'Markdown',
+                reply_markup: buildSettingsKeyboard(),
+            });
+            await tgRequest('answerCallbackQuery', { callback_query_id: cq.id, text: `aria2c → ${v}` });
+            return;
+        }
+        if (cq.data.startsWith('set_player_client:')) {
+            const v = cq.data.slice('set_player_client:'.length);
+            if (!PLAYER_CLIENT_PRESETS.includes(v)) {
+                await tgRequest('answerCallbackQuery', { callback_query_id: cq.id, text: 'ערך לא חוקי' });
+                return;
+            }
+            try { fs.writeFileSync(PLAYER_CLIENT_FILE, v); } catch (_) {}
+            await tgRequest('editMessageText', {
+                chat_id: cq.message.chat.id,
+                message_id: cq.message.message_id,
+                text: buildSettingsText(),
+                parse_mode: 'Markdown',
+                reply_markup: buildSettingsKeyboard(),
+            });
+            await tgRequest('answerCallbackQuery', { callback_query_id: cq.id, text: `player → ${v}` });
+            return;
+        }
+
         // Quality choice from index.js: callback_data format `quality:{requestId}:{continue|rotate}`
         if (cq.data.startsWith('quality:')) {
             const parts = cq.data.split(':');
@@ -471,6 +568,10 @@ async function handleUpdate(update) {
             await sendMessage(runningChild ? '🟢 רץ.' : '⚪ לא רץ.');
             break;
         }
+        case '/settings': {
+            await sendMessage(buildSettingsText(), { reply_markup: buildSettingsKeyboard() });
+            break;
+        }
         case '/help': {
             await sendMessage(
                 '*פקודות:*\n' +
@@ -478,6 +579,7 @@ async function handleUpdate(update) {
                 '/restart — הפעל מחדש (הורג את הריצה הנוכחית)\n' +
                 '/stop — עצור\n' +
                 '/status — סטטוס\n' +
+                '/settings — כוונון מהירות (aria2c + player_client)\n' +
                 '/help — עזרה\n\n' +
                 'גם אפשר לשלוח קובץ `.txt` ואני אשמור אותו כ-`cookies1.txt`.'
             );

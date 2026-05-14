@@ -40,6 +40,35 @@ function writeActiveButtonsId(id) {
     } catch (_) {}
 }
 
+// Shared with bot-listener.js: download-speed tuning knobs. Bot writes these on
+// /settings clicks; yt-dlp spawn sites here read them per video so changes apply
+// from the next video without a restart.
+const ARIA2C_PRESET_FILE = path.join(__dirname, '.aria2c-preset');
+const PLAYER_CLIENT_FILE = path.join(__dirname, '.player-client-preset');
+const ARIA2C_PRESETS = ['6', '8', '12', '16'];
+const PLAYER_CLIENT_PRESETS = ['default', 'ios,tv', 'ios', 'tv', 'web'];
+const ARIA2C_DEFAULT = '16';
+const PLAYER_CLIENT_DEFAULT = 'default';
+
+function readAria2cPreset() {
+    try {
+        if (fs.existsSync(ARIA2C_PRESET_FILE)) {
+            const v = fs.readFileSync(ARIA2C_PRESET_FILE, 'utf8').trim();
+            if (ARIA2C_PRESETS.includes(v)) return v;
+        }
+    } catch (_) {}
+    return ARIA2C_DEFAULT;
+}
+function readPlayerClientPreset() {
+    try {
+        if (fs.existsSync(PLAYER_CLIENT_FILE)) {
+            const v = fs.readFileSync(PLAYER_CLIENT_FILE, 'utf8').trim();
+            if (PLAYER_CLIENT_PRESETS.includes(v)) return v;
+        }
+    } catch (_) {}
+    return PLAYER_CLIENT_DEFAULT;
+}
+
 // Standard 3-button row appended to every Telegram message we send/edit.
 // Pass `extraTopRow` for context-specific buttons (e.g. quality "Switch Cookies").
 function controlButtons(extraTopRow = null) {
@@ -380,7 +409,11 @@ function sourceEmoji(type) {
 
 function listFormats(youtubeUrl, cookieArgs) {
     return new Promise((resolve, reject) => {
-        const args = [...cookieArgs, '-F', '--no-playlist', '--js-runtimes', 'node', youtubeUrl];
+        const playerClient = readPlayerClientPreset();
+        const extractorArgs = playerClient === 'default'
+            ? []
+            : ['--extractor-args', `youtube:player_client=${playerClient}`];
+        const args = [...cookieArgs, ...extractorArgs, '-F', '--no-playlist', '--js-runtimes', 'node', youtubeUrl];
         const child = spawn('yt-dlp', args, { shell: process.platform === 'win32' });
         let output = '';
         let stderr = '';
@@ -412,12 +445,19 @@ function listFormats(youtubeUrl, cookieArgs) {
 
 function downloadFromYoutube(youtubeUrl, outputFile, cookieArgs, onProgress) {
     return new Promise((resolve, reject) => {
+        const aria2cConns = readAria2cPreset();
+        const playerClient = readPlayerClientPreset();
+        const extractorArgs = playerClient === 'default'
+            ? []
+            : ['--extractor-args', `youtube:player_client=${playerClient}`];
+        console.log(`Download settings: aria2c x${aria2cConns}, player_client=${playerClient}`);
         const args = [
             ...cookieArgs,
+            ...extractorArgs,
             '--no-playlist',
             '--js-runtimes', 'node',
             '--downloader', 'aria2c',
-            '--downloader-args', 'aria2c:-x 16 -s 16 -j 16 -k 5M --console-log-level=info --summary-interval=1',
+            '--downloader-args', `aria2c:-x ${aria2cConns} -s ${aria2cConns} -j ${aria2cConns} -k 5M --console-log-level=info --summary-interval=1`,
             '--sleep-requests', '2',
             '-f', 'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best',
             '-S', 'res:1080,fps,vcodec:h264:vp9,acodec:m4a',
