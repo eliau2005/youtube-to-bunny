@@ -994,7 +994,15 @@ async function processVideo(videoObj, cookieArgs, ctx) {
         await forceUpdateLive(afterExtract + `📤 מתחיל העלאה ל-Bunny Storage...`);
 
         // ── Phase 4: Bunny Storage upload ────────────────────────────────
-        const audioFileName = `audio/${videoObj.slug}.mp3`;
+        // Mirror Bunny Stream's collection layout: organize MP3s under a
+        // subfolder named after subCategory (same value used for the Stream
+        // collection). Falls back to flat `audio/{slug}.mp3` if subCategory
+        // is missing/empty. uploadToBunnyStorage URL-encodes each path
+        // segment so Hebrew subCategory names roundtrip safely.
+        const subFolder = videoObj.subCategory && String(videoObj.subCategory).trim();
+        const audioFileName = subFolder
+            ? `audio/${subFolder}/${videoObj.slug}.mp3`
+            : `audio/${videoObj.slug}.mp3`;
         const storageStart = Date.now();
         console.log(`Uploading MP3 to Bunny Storage as ${audioFileName}...`);
         const audioPublicUrl = await uploadToBunnyStorage(mp3File, audioFileName, (pct, speed, eta) => {
