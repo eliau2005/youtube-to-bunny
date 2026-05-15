@@ -855,8 +855,15 @@ async function processVideo(videoObj, cookieArgs, ctx) {
     // attempts). Otherwise create a fresh one (legacy/standalone behavior).
     let liveId = providedLiveId || null;
     let lastEditAt = 0;
-    const DL_THROTTLE_MS  = 2000; // download/upload progress: every 2 sec
-    const UPL_THROTTLE_MS = 2000;
+    // Throttle scales with the active parallel-pool size to keep the
+    // chat-wide edit rate under Telegram's ~1 msg/s per-chat limit. With N
+    // parallel entries each editing at 1/throttle, the chat-wide rate is
+    // N * (1000 / throttle); pinning throttle to N * 1500 keeps that at
+    // ~0.67/s regardless of parallelism. At N=1 the floor of 2000ms keeps
+    // single-stream UX unchanged.
+    const parallelN = parseInt(readParallelPreset(), 10) || 1;
+    const DL_THROTTLE_MS  = Math.max(2000, parallelN * 1500);
+    const UPL_THROTTLE_MS = Math.max(2000, parallelN * 1500);
 
     const initLive = async (text) => {
         if (liveId) {

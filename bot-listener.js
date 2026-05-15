@@ -178,7 +178,9 @@ let pendingPlaylistInfo = null; // { items: number, fileName: string } when a .j
 
 // ─── Telegram API helpers ────────────────────────────────────────────────────
 
-function tgRequest(method, params = {}, timeoutMs = 60000) {
+// Issue a single Telegram API request without retry. Internal — callers go
+// through tgRequest() which layers 429 retry on top.
+function tgRequestOnce(method, params, timeoutMs) {
     return new Promise((resolve) => {
         const body = JSON.stringify(params);
         const req = https.request({
@@ -200,6 +202,27 @@ function tgRequest(method, params = {}, timeoutMs = 60000) {
         req.write(body);
         req.end();
     });
+}
+
+// 429-aware wrapper. When Telegram returns Too Many Requests with
+// parameters.retry_after=N, sleep N+1 seconds and retry, up to 3 attempts.
+// Critical for the exit-handler filename prompt under heavy parallel load:
+// without this the prompt is sent fire-and-forget and silently swallowed
+// when Telegram is still in a backoff window from index.js's progress edits.
+async function tgRequest(method, params = {}, timeoutMs = 60000) {
+    const MAX_ATTEMPTS = 3;
+    let last = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        last = await tgRequestOnce(method, params, timeoutMs);
+        const isRateLimited = last && last.ok === false && last.error_code === 429;
+        if (!isRateLimited) return last;
+        if (attempt === MAX_ATTEMPTS) return last;
+        const retryAfter = (last.parameters && last.parameters.retry_after) || 1;
+        const waitMs = (retryAfter + 1) * 1000;
+        console.warn(`[tgRequest] 429 on ${method} (attempt ${attempt}/${MAX_ATTEMPTS}); retrying in ${waitMs}ms`);
+        await new Promise(r => setTimeout(r, waitMs));
+    }
+    return last;
 }
 
 async function sendMessage(text, opts = {}) {
