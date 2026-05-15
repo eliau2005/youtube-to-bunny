@@ -42,10 +42,13 @@ const ACTIVE_BUTTONS_FILE = path.join(__dirname, '.active-buttons-msg-id');
 // of the whitelisted preset values; missing/invalid → fall back to default.
 const ARIA2C_PRESET_FILE = path.join(__dirname, '.aria2c-preset');
 const PLAYER_CLIENT_FILE = path.join(__dirname, '.player-client-preset');
+const PARALLEL_PRESET_FILE = path.join(__dirname, '.parallel-preset');
 const ARIA2C_PRESETS = ['6', '8', '12', '16'];
 const PLAYER_CLIENT_PRESETS = ['default', 'ios,tv', 'ios', 'tv', 'web'];
+const PARALLEL_PRESETS = ['1', '2', '3', '4', '5'];
 const ARIA2C_DEFAULT = '16';
 const PLAYER_CLIENT_DEFAULT = 'default';
+const PARALLEL_DEFAULT = '1';
 
 function isNoWaitMode() { return fs.existsSync(NO_WAIT_FLAG); }
 
@@ -66,6 +69,15 @@ function readPlayerClientPreset() {
         }
     } catch (_) {}
     return PLAYER_CLIENT_DEFAULT;
+}
+function readParallelPreset() {
+    try {
+        if (fs.existsSync(PARALLEL_PRESET_FILE)) {
+            const v = fs.readFileSync(PARALLEL_PRESET_FILE, 'utf8').trim();
+            if (PARALLEL_PRESETS.includes(v)) return v;
+        }
+    } catch (_) {}
+    return PARALLEL_DEFAULT;
 }
 
 function readActiveButtonsId() {
@@ -104,10 +116,12 @@ function makeActiveButtons(newMsgId) {
 function buildSettingsText() {
     const a = readAria2cPreset();
     const p = readPlayerClientPreset();
+    const par = readParallelPreset();
     return (
         '⚙️ *הגדרות מהירות הורדה*\n\n' +
         `🔗 חיבורי aria2c: \`${a}\`\n` +
-        `🎬 \`player_client\`: \`${p}\`\n\n` +
+        `🎬 \`player_client\`: \`${p}\`\n` +
+        `🔀 הורדה במקביל (אודיו בלבד): \`×${par}\`\n\n` +
         '_השינוי יחול מהסרטון הבא בריצה הנוכחית._'
     );
 }
@@ -115,6 +129,7 @@ function buildSettingsText() {
 function buildSettingsKeyboard() {
     const a = readAria2cPreset();
     const p = readPlayerClientPreset();
+    const par = readParallelPreset();
     const aria2cRow = ARIA2C_PRESETS.map(v => ({
         text: (v === a ? '✓ ' : '') + v,
         callback_data: `set_aria2c:${v}`,
@@ -122,6 +137,10 @@ function buildSettingsKeyboard() {
     const playerRow = PLAYER_CLIENT_PRESETS.map(v => ({
         text: (v === p ? '✓ ' : '') + v,
         callback_data: `set_player_client:${v}`,
+    }));
+    const parallelRow = PARALLEL_PRESETS.map(v => ({
+        text: (v === par ? '✓ ' : '') + `×${v}`,
+        callback_data: `set_parallel:${v}`,
     }));
     const noWaitOn = isNoWaitMode();
     const toggleBtn = noWaitOn
@@ -132,7 +151,7 @@ function buildSettingsKeyboard() {
         { text: '🔄 Restart', callback_data: 'restart' },
         toggleBtn,
     ];
-    return { inline_keyboard: [aria2cRow, playerRow, controlsRow] };
+    return { inline_keyboard: [aria2cRow, playerRow, parallelRow, controlsRow] };
 }
 
 function controlButtons(extraTopRow = null) {
@@ -416,6 +435,23 @@ async function handleUpdate(update) {
             await tgRequest('answerCallbackQuery', { callback_query_id: cq.id, text: `player → ${v}` });
             return;
         }
+        if (cq.data.startsWith('set_parallel:')) {
+            const v = cq.data.slice('set_parallel:'.length);
+            if (!PARALLEL_PRESETS.includes(v)) {
+                await tgRequest('answerCallbackQuery', { callback_query_id: cq.id, text: 'ערך לא חוקי' });
+                return;
+            }
+            try { fs.writeFileSync(PARALLEL_PRESET_FILE, v); } catch (_) {}
+            await tgRequest('editMessageText', {
+                chat_id: cq.message.chat.id,
+                message_id: cq.message.message_id,
+                text: buildSettingsText(),
+                parse_mode: 'Markdown',
+                reply_markup: buildSettingsKeyboard(),
+            });
+            await tgRequest('answerCallbackQuery', { callback_query_id: cq.id, text: `parallel → ×${v}` });
+            return;
+        }
 
         // Quality choice from index.js: callback_data format `quality:{requestId}:{continue|rotate}`
         if (cq.data.startsWith('quality:')) {
@@ -579,7 +615,7 @@ async function handleUpdate(update) {
                 '/restart — הפעל מחדש (הורג את הריצה הנוכחית)\n' +
                 '/stop — עצור\n' +
                 '/status — סטטוס\n' +
-                '/settings — כוונון מהירות (aria2c + `player_client`)\n' +
+                '/settings — כוונון מהירות (aria2c + `player_client` + מקבילות אודיו)\n' +
                 '/help — עזרה\n\n' +
                 '*צינור עיבוד דו-פורמטי (לכל סרטון):*\n' +
                 '1️⃣ 📥 הורדה — מ-YouTube (חדש) או מ-Bunny Stream (השלמת אודיו)\n' +

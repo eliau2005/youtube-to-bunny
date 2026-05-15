@@ -51,10 +51,13 @@ function writeActiveButtonsId(id) {
 // from the next video without a restart.
 const ARIA2C_PRESET_FILE = path.join(__dirname, '.aria2c-preset');
 const PLAYER_CLIENT_FILE = path.join(__dirname, '.player-client-preset');
+const PARALLEL_PRESET_FILE = path.join(__dirname, '.parallel-preset');
 const ARIA2C_PRESETS = ['6', '8', '12', '16'];
 const PLAYER_CLIENT_PRESETS = ['default', 'ios,tv', 'ios', 'tv', 'web'];
+const PARALLEL_PRESETS = ['1', '2', '3', '4', '5'];
 const ARIA2C_DEFAULT = '16';
 const PLAYER_CLIENT_DEFAULT = 'default';
+const PARALLEL_DEFAULT = '1';
 
 function readAria2cPreset() {
     try {
@@ -64,6 +67,16 @@ function readAria2cPreset() {
         }
     } catch (_) {}
     return ARIA2C_DEFAULT;
+}
+
+function readParallelPreset() {
+    try {
+        if (fs.existsSync(PARALLEL_PRESET_FILE)) {
+            const v = fs.readFileSync(PARALLEL_PRESET_FILE, 'utf8').trim();
+            if (PARALLEL_PRESETS.includes(v)) return v;
+        }
+    } catch (_) {}
+    return PARALLEL_DEFAULT;
 }
 function readPlayerClientPreset() {
     try {
@@ -1125,26 +1138,68 @@ async function run() {
         `📊 סה״כ בפלייליסט: ${total}\n` +
         `✅ כבר הועלו: ${completed}\n` +
         `⏳ נותרו לעיבוד: ${remaining}  (full=${fullCount}, audio-only=${audioOnlyCount})\n` +
+        `🔀 הורדה במקביל (אודיו): ×${readParallelPreset()}\n` +
         (cookieCount
             ? `🍪 ${cookieCount} cookies (לפי סדר): ${sources.map(s => s.label).join(' → ')}`
             : `🍪 ללא cookies (אין כניסות שדורשות YouTube)`)
     );
 
-    for (let i = 0; i < playlistData.length; i++) {
-        const video = playlistData[i];
-        const mode = classifyMode(video);
-
-        if (mode === 'skip') {
-            // Either already complete, or invalid URL — log and move on.
-            const reason = video.audioUrl ? 'already complete' : 'invalid/empty youtubeUrl';
-            console.log(`Skipping (${reason}): ${video.lessonTitle || video.videoId}`);
-            continue;
+    // ── Concurrent dispatch infrastructure ─────────────────────────────────
+    // Audio-only entries can run in parallel (Bunny CDN handles concurrency
+    // fine and there are no cookies to manage). Full-mode entries stay
+    // strictly sequential — cookie rotation depends on a known-good cookie
+    // state, and parallel YouTube hits under one cookie pool accelerate
+    // bot detection. The pool's size is re-read per dispatch so a /settings
+    // change takes effect on the next entry.
+    const audioPool = new Set();
+    const drainAudioPool = async () => {
+        while (audioPool.size > 0) {
+            try { await Promise.race(audioPool); } catch (_) {}
         }
+    };
+    // Serialize playlist writes through a promise chain so concurrent audio
+    // entries can't trample each other's snapshots.
+    let writeChain = Promise.resolve();
+    const writePlaylist = () => {
+        writeChain = writeChain.then(() => {
+            try { fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2)); }
+            catch (e) { console.error('Playlist write failed:', e.message); }
+        });
+        return writeChain;
+    };
+    // Mode of the next non-skip entry after index i, or null if none.
+    const nextPendingMode = (i) => {
+        for (let j = i + 1; j < playlistData.length; j++) {
+            const m = classifyMode(playlistData[j]);
+            if (m !== 'skip') return m;
+        }
+        return null;
+    };
+    // Inter-video wait fires only when the next pending entry is full-mode.
+    // Audio→Audio skips the wait entirely (Bunny doesn't need anti-bot pacing).
+    // Audio→Full and Full→Full keep the 2-6 min (or 10s no-wait) cooling-off.
+    const maybeInterVideoWait = async (i, doneText, liveId) => {
+        const nextMode = nextPendingMode(i);
+        if (nextMode !== 'full') return;
+        const noWait = isNoWaitMode();
+        const delaySec = noWait ? 10 : Math.floor(Math.random() * (360 - 120 + 1)) + 120;
+        console.log(`\n⏱️  Waiting ${noWait ? '10s (no-wait mode)' : (delaySec / 60).toFixed(1) + ' min'} before next download...`);
+        await sleepWithProgressBar({
+            totalSec: delaySec,
+            liveId,
+            bodyTop: doneText + '\n\n⏳ *המתנה לסרטון הבא:*',
+            finalText: doneText,
+            tickMs: 15000,
+        });
+    };
 
+    // Per-entry orchestration shared by both audio-only (pool) and full
+    // (sequential) branches. Builds the live message, then runs processVideo
+    // with cookie rotation for full mode or single-attempt for audio-only.
+    const dispatchEntry = async (video, i, mode) => {
         let result = null;
         let attempt = 0;
 
-        // ONE telegram message per video — edited throughout (download → switching → success/failure).
         const title = video.lessonTitle || video.videoId || 'Unknown';
         const overallPct = total > 0 ? Math.round((completed / total) * 100) : 0;
         const startMsg = await sendTelegramMessage(
@@ -1196,30 +1251,70 @@ async function run() {
             }
         }
 
+        return { result, liveId };
+    };
+
+    for (let i = 0; i < playlistData.length; i++) {
+        const video = playlistData[i];
+        const mode = classifyMode(video);
+
+        if (mode === 'skip') {
+            const reason = video.audioUrl ? 'already complete' : 'invalid/empty youtubeUrl';
+            console.log(`Skipping (${reason}): ${video.lessonTitle || video.videoId}`);
+            continue;
+        }
+
+        if (mode === 'audio-only') {
+            // Pool dispatch: respect the live /settings concurrency cap. No
+            // inter-video wait — the outer loop fans out the next entry as
+            // soon as a slot frees up.
+            const N = parseInt(readParallelPreset(), 10) || 1;
+            while (audioPool.size >= N) {
+                try { await Promise.race(audioPool); } catch (_) {}
+            }
+            const idx = i;
+            const promise = (async () => {
+                try {
+                    const { result } = await dispatchEntry(video, idx, 'audio-only');
+                    if (result.success) {
+                        completed++;
+                        sessionBytes += result.bytes || 0;
+                        console.log(`Progress: ${completed}/${total} videos completed.`);
+                        await writePlaylist();
+                    } else {
+                        // Non-fatal: log, persist, and let the next run retry.
+                        sessionFailures++;
+                        await writePlaylist();
+                    }
+                } catch (err) {
+                    console.error(`Audio-only dispatch crashed for entry ${idx + 1}:`, err.message);
+                    sessionFailures++;
+                }
+            })();
+            audioPool.add(promise);
+            promise.finally(() => audioPool.delete(promise));
+            continue;
+        }
+
+        // Full mode: drain any in-flight audio first so cookies aren't being
+        // exercised concurrently with stragglers and the playlist state is
+        // fully flushed before we start the next sequential entry.
+        await drainAudioPool();
+
+        const { result, liveId } = await dispatchEntry(video, i, 'full');
+
         if (result.success) {
             completed++;
             sessionBytes += result.bytes || 0;
             console.log(`Progress: ${completed}/${total} videos completed.`);
-            fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
-
-            const hasMore = playlistData.slice(i + 1).some(v => classifyMode(v) !== 'skip');
-            if (hasMore) {
-                // Random 2–6 min anti-bot delay; 10s when no-wait mode is on (toggled via Telegram)
-                const noWait = isNoWaitMode();
-                const delaySec = noWait ? 10 : Math.floor(Math.random() * (360 - 120 + 1)) + 120;
-                console.log(`\n⏱️  Waiting ${noWait ? '10s (no-wait mode)' : (delaySec / 60).toFixed(1) + ' min'} before next download...`);
-                await sleepWithProgressBar({
-                    totalSec: delaySec,
-                    liveId: result.liveId,
-                    bodyTop: result.doneText + '\n\n⏳ *המתנה לסרטון הבא:*',
-                    finalText: result.doneText, // restore clean state at end
-                    tickMs: 15000
-                });
-            }
+            await writePlaylist();
+            await maybeInterVideoWait(i, result.doneText, result.liveId);
         } else {
-            // All sources exhausted — stop entirely. Use the per-video message for the stop notice.
+            // All cookie sources exhausted — fatal. Drain in-flight audio
+            // first so their temp files clean up via their own finally blocks.
             sessionFailures++;
-            fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
+            await writePlaylist();
+            await drainAudioPool();
             const failedTitle = video.lessonTitle || video.videoId || 'לא ידוע';
             const sessionDur = formatDuration(Math.round((Date.now() - sessionStart) / 1000));
             const stopText =
@@ -1235,7 +1330,9 @@ async function run() {
         }
     }
 
-    fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
+    // Drain any audio-only entries still in flight from the tail of the list.
+    await drainAudioPool();
+    await writePlaylist();
     console.log('\nSync complete and updated file saved successfully!');
 
     const sessionDur = formatDuration(Math.round((Date.now() - sessionStart) / 1000));
