@@ -819,8 +819,18 @@ function classifyMode(videoObj) {
 }
 
 async function processVideo(videoObj, cookieArgs, ctx) {
-    const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
-    const mp3File = path.join(__dirname, `${videoObj.videoId}.mp3`);
+    // Stable per-entry filename stem. Falling back through this chain matters
+    // for two reasons: (1) empty videoId would resolve to ".mp4" — a hidden
+    // file in the project root — and (2) under parallel dispatch, two entries
+    // with empty videoId would collide on the same temp file AND on yt-dlp's
+    // ".mp4.part-FragN.part" fragment files, causing rename failures. The
+    // priority order also keeps temp filenames human-debuggable.
+    const stem = (videoObj.videoId && String(videoObj.videoId).trim())
+        || extractBunnyGuid(videoObj.youtubeUrl)
+        || (videoObj.slug && String(videoObj.slug).trim())
+        || `entry-${ctx && ctx.videoIndex ? ctx.videoIndex : Date.now()}`;
+    const tmpFile = path.join(__dirname, `${stem}.mp4`);
+    const mp3File = path.join(__dirname, `${stem}.mp3`);
     const partFile = `${tmpFile}.part`;
     const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
 
