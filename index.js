@@ -6,7 +6,13 @@ const path = require('path');
 const readline = require('readline');
 const https = require('https');
 
-const { BUNNY_LIBRARY_ID, BUNNY_API_KEY } = process.env;
+const {
+    BUNNY_LIBRARY_ID,
+    BUNNY_API_KEY,
+    BUNNY_STORAGE_API_KEY,
+    BUNNY_STORAGE_ZONE_NAME,
+    BUNNY_PULL_ZONE_URL,
+} = process.env;
 
 const headers = {
     'AccessKey': BUNNY_API_KEY,
@@ -571,17 +577,242 @@ function uploadToBunny(guid, filePath, onProgress) {
     });
 }
 
+// ─── Bunny Stream → MP4 download (audio-only re-process path) ────────────────
+// Parse the GUID out of an iframe URL: https://iframe.mediadelivery.net/play/{libId}/{guid}
+function extractBunnyGuid(streamUrl) {
+    if (!streamUrl || typeof streamUrl !== 'string') return null;
+    const m = streamUrl.match(/\/play\/\d+\/([a-f0-9-]+)/i);
+    return m ? m[1] : null;
+}
+
+// Downloads from a Bunny Stream iframe URL. yt-dlp handles BunnyCDN's HLS
+// playlist natively, no cookies needed. We only need the audio for MP3
+// extraction, so -f "bestaudio/best" saves significant bandwidth vs. the full
+// 1080p video. --remux-video mp4 forces a predictable container so the
+// ffmpeg input path is stable.
+function downloadFromBunny(streamUrl, outputFile, onProgress) {
+    return new Promise((resolve, reject) => {
+        const args = [
+            '--no-playlist',
+            '-f', 'bestaudio/best',
+            '--remux-video', 'mp4',
+            '--newline',
+            '--progress-template', 'PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.status)s',
+            '-o', outputFile,
+            streamUrl,
+        ];
+
+        const child = spawn('yt-dlp', args, { shell: process.platform === 'win32' });
+        let stderrTail = '';
+        let activeBar = false;
+
+        const handleLine = (line) => {
+            if (!line) return;
+            if (line.startsWith('PROGRESS|')) {
+                const parts = line.split('|');
+                const percentStr = (parts[1] || '').trim();
+                const speedStr = (parts[2] || '').trim();
+                const etaStr = (parts[3] || '').trim();
+                const percent = parseFloat(percentStr.replace('%', ''));
+                if (!isNaN(percent)) {
+                    renderProgressBar('Downloading', percent, speedStr || 'N/A', etaStr || '--:--');
+                    activeBar = true;
+                    if (onProgress) onProgress(percent, speedStr || 'N/A', etaStr || '--:--');
+                }
+            }
+        };
+
+        const consume = (buf, isErr) => {
+            const text = buf.toString();
+            if (isErr) stderrTail = (stderrTail + text).slice(-2000);
+            const lines = text.split(/\r\n|\r|\n/);
+            for (const l of lines) handleLine(l);
+        };
+
+        child.stdout.on('data', (d) => consume(d, false));
+        child.stderr.on('data', (d) => consume(d, true));
+
+        child.on('close', (code) => {
+            if (activeBar) endProgressLine();
+            if (code === 0) resolve();
+            else reject(new Error(`yt-dlp (Bunny) exited with code ${code}. ${stderrTail.trim().split('\n').slice(-3).join(' | ')}`));
+        });
+
+        child.on('error', reject);
+    });
+}
+
+// ─── ffmpeg-based MP3 extraction ─────────────────────────────────────────────
+// Probes input duration with ffprobe (fail-soft: indeterminate progress on
+// failure), then runs ffmpeg to produce a lightweight MP3 (64k mono 22050Hz).
+// Parses -progress pipe:1 output (out_time_ms=… progress=continue|end) to
+// drive the Telegram live message. Progress is clamped to 99% until the
+// process reports progress=end, at which point we emit 100%.
+function probeDurationMs(inputFile) {
+    return new Promise((resolve) => {
+        const child = spawn('ffprobe', [
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format',
+            inputFile,
+        ], { shell: process.platform === 'win32' });
+        let out = '';
+        child.stdout.on('data', (d) => { out += d.toString(); });
+        child.on('close', () => {
+            try {
+                const parsed = JSON.parse(out);
+                const sec = parseFloat(parsed?.format?.duration);
+                if (!isNaN(sec) && sec > 0) return resolve(Math.round(sec * 1000));
+            } catch (_) {}
+            resolve(null); // signal "unknown duration"
+        });
+        child.on('error', () => resolve(null));
+    });
+}
+
+function extractAudio(inputFile, outputFile, onProgress) {
+    return new Promise(async (resolve, reject) => {
+        const totalMs = await probeDurationMs(inputFile);
+
+        const args = [
+            '-y', '-hide_banner',
+            '-i', inputFile,
+            '-vn',
+            '-ac', '1',
+            '-ar', '22050',
+            '-b:a', '64k',
+            '-progress', 'pipe:1',
+            '-nostats',
+            outputFile,
+        ];
+
+        const child = spawn('ffmpeg', args, { shell: process.platform === 'win32' });
+        let stderrTail = '';
+        let buffered = '';
+
+        const emit = (outTimeMs, ended) => {
+            if (!onProgress) return;
+            if (ended) return onProgress(100);
+            if (totalMs && totalMs > 0) {
+                const pct = Math.min(99, (outTimeMs / totalMs) * 100);
+                onProgress(pct);
+            } else {
+                onProgress(null); // indeterminate
+            }
+        };
+
+        child.stdout.on('data', (d) => {
+            buffered += d.toString();
+            let idx;
+            while ((idx = buffered.indexOf('\n')) !== -1) {
+                const line = buffered.slice(0, idx).trim();
+                buffered = buffered.slice(idx + 1);
+                if (line.startsWith('out_time_ms=')) {
+                    const us = parseInt(line.slice('out_time_ms='.length), 10);
+                    if (!isNaN(us)) emit(us / 1000, false);
+                } else if (line === 'progress=end') {
+                    emit(0, true);
+                }
+            }
+        });
+        child.stderr.on('data', (d) => {
+            stderrTail = (stderrTail + d.toString()).slice(-2000);
+        });
+
+        child.on('close', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`ffmpeg exited with code ${code}. ${stderrTail.trim().split('\n').slice(-3).join(' | ')}`));
+        });
+        child.on('error', reject);
+    });
+}
+
+// ─── Bunny Storage upload (MP3 → Storage Zone) ───────────────────────────────
+// PUT to storage.bunnycdn.com/{zone}/{fileName}. Content-Type MUST be
+// audio/mpeg — anything else makes the Pull-Zone URL behave as a download
+// attachment instead of an inline playable stream, breaking <audio> tags
+// and mobile players.
+function uploadToBunnyStorage(filePath, fileName, onProgress) {
+    return new Promise((resolve, reject) => {
+        const fileSize = fs.statSync(filePath).size;
+        let uploadedBytes = 0;
+        let lastTime = Date.now();
+        let lastLoaded = 0;
+        let lastSpeed = 0;
+        let activeBar = false;
+
+        const fileStream = fs.createReadStream(filePath);
+
+        fileStream.on('data', (chunk) => {
+            uploadedBytes += chunk.length;
+            const now = Date.now();
+            const dt = (now - lastTime) / 1000;
+            if (dt >= 0.3 || uploadedBytes === fileSize) {
+                lastSpeed = (uploadedBytes - lastLoaded) / Math.max(dt, 0.001);
+                const percent = (uploadedBytes / fileSize) * 100;
+                const remaining = lastSpeed > 0 ? (fileSize - uploadedBytes) / lastSpeed : Infinity;
+                renderProgressBar('Storage    ', percent, formatSpeed(lastSpeed), formatEta(remaining));
+                activeBar = true;
+                if (onProgress) onProgress(percent, formatSpeed(lastSpeed), formatEta(remaining));
+                lastTime = now;
+                lastLoaded = uploadedBytes;
+            }
+        });
+
+        // URL-encode each path segment so spaces/Unicode survive (slug is
+        // ASCII-safe today, but this guard keeps us safe if that ever changes).
+        const encodedPath = fileName.split('/').map(encodeURIComponent).join('/');
+        const url = `https://storage.bunnycdn.com/${BUNNY_STORAGE_ZONE_NAME}/${encodedPath}`;
+
+        axios.put(url, fileStream, {
+            headers: {
+                'AccessKey': BUNNY_STORAGE_API_KEY,
+                'Content-Type': 'audio/mpeg',
+            },
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity,
+        })
+            .then(() => {
+                if (activeBar) endProgressLine();
+                const publicUrl = `https://${BUNNY_PULL_ZONE_URL}/${encodedPath}`;
+                resolve(publicUrl);
+            })
+            .catch((err) => {
+                if (activeBar) endProgressLine();
+                reject(err);
+            });
+    });
+}
+
+// ─── Entry classification ────────────────────────────────────────────────────
+// Inspect the playlist entry's two URL fields and decide which pipeline branch
+// applies. Order matters — invalid URL first so we never feed garbage to
+// yt-dlp/ffmpeg; then 'skip' for fully-done entries; then 'audio-only' for
+// back-fill; else 'full'.
+function classifyMode(videoObj) {
+    const url = videoObj && videoObj.youtubeUrl;
+    if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url)) return 'skip';
+    const onBunny = url.includes('mediadelivery.net');
+    const hasAudio = !!(videoObj.audioUrl && typeof videoObj.audioUrl === 'string' && videoObj.audioUrl.length);
+    if (onBunny && hasAudio) return 'skip';
+    if (onBunny && !hasAudio) return 'audio-only';
+    return 'full';
+}
+
 async function processVideo(videoObj, cookieArgs, ctx) {
     const tmpFile = path.join(__dirname, `${videoObj.videoId}.mp4`);
+    const mp3File = path.join(__dirname, `${videoObj.videoId}.mp3`);
     const partFile = `${tmpFile}.part`;
     const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
 
     // Clean up any existing files from previous failed/interrupted attempts
     if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
     if (fs.existsSync(partFile)) fs.unlinkSync(partFile);
+    if (fs.existsSync(mp3File)) fs.unlinkSync(mp3File);
 
     // Header shown at top of every Telegram message for this video
-    const { videoIndex, total, completed, sourceType, sourceLabel, attempt, liveId: providedLiveId } = ctx;
+    const { videoIndex, total, completed, sourceType, sourceLabel, attempt, liveId: providedLiveId, mode } = ctx;
+    const isAudioOnly = mode === 'audio-only';
     const overallPct = total > 0 ? Math.round((completed / total) * 100) : 0;
     const sourceTag = sourceLabel ? ` | ${sourceEmoji(sourceType)} ${sourceLabel}` : '';
     const attemptLabel = attempt > 1 ? ` (ניסיון ${attempt})` : '';
@@ -628,102 +859,168 @@ async function processVideo(videoObj, cookieArgs, ctx) {
     const videoStart = Date.now();
 
     try {
-        console.log(`\n--- Processing [${videoIndex}/${total}]: ${title} ---`);
-        await initLive(`${header}\n\n📥 מתחיל הורדה מ-YouTube...`);
+        console.log(`\n--- Processing [${videoIndex}/${total}] (${mode}): ${title} ---`);
 
-        console.log('Downloading from YouTube at maximum quality...');
-        const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
-        if (maxRes > 0 && maxRes < 1080) {
-            // Could be either: (a) cookies session is degraded, or (b) the video itself
-            // was uploaded below 1080p. Ask the user via Telegram which it is.
-            const choice = await askUserQualityChoice({
-                liveId, videoIndex, total, title, maxRes
-            });
-            if (choice === 'rotate') {
-                throw new Error(`User chose to rotate — source offers only ${maxRes}p`);
+        // ── Phase 1: Download ─────────────────────────────────────────────
+        let downloadedRes = null;     // YouTube only — tracked for the summary
+        let downloadLabel;            // 'הורדה (YouTube)' or 'הורדה (Bunny)'
+
+        if (isAudioOnly) {
+            downloadLabel = 'הורדה (Bunny)';
+            const guidLog = extractBunnyGuid(videoObj.youtubeUrl);
+            console.log(`Audio-only re-process: pulling MP4 from Bunny${guidLog ? ` (guid=${guidLog})` : ''}`);
+            await initLive(`${header}\n\n📥 מתחיל הורדה מ-Bunny...`);
+        } else {
+            downloadLabel = 'הורדה (YouTube)';
+            await initLive(`${header}\n\n📥 מתחיל הורדה מ-YouTube...`);
+            console.log('Downloading from YouTube at maximum quality...');
+            const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
+            if (maxRes > 0 && maxRes < 1080) {
+                // Could be either: (a) cookies session is degraded, or (b) the video
+                // itself was uploaded below 1080p. Ask the user which it is.
+                const choice = await askUserQualityChoice({
+                    liveId, videoIndex, total, title, maxRes
+                });
+                if (choice === 'rotate') {
+                    throw new Error(`User chose to rotate — source offers only ${maxRes}p`);
+                }
+                console.log(`User chose to continue at ${maxRes}p.`);
             }
-            // 'continue' → fall through and download at the available quality
-            console.log(`User chose to continue at ${maxRes}p.`);
+            // Quality actually downloaded: capped at 1080p by the format selector.
+            downloadedRes = maxRes > 0 ? Math.min(maxRes, 1080) : null;
         }
 
         const downloadStart = Date.now();
-
-        await downloadFromYoutube(videoObj.youtubeUrl, tmpFile, cookieArgs, (pct, speed, eta) => {
+        const onDlProgress = (pct, speed, eta) => {
             updateLive(
                 `${header}\n\n` +
-                `📥 *הורדה:* ${pct.toFixed(1)}%\n` +
+                `📥 *${downloadLabel}:* ${pct.toFixed(1)}%\n` +
                 `\`${telegramBar(pct)}\`\n` +
                 `⚡ ${speed} | ETA ${eta}`,
                 DL_THROTTLE_MS
             );
-        });
+        };
+        if (isAudioOnly) {
+            await downloadFromBunny(videoObj.youtubeUrl, tmpFile, onDlProgress);
+        } else {
+            await downloadFromYoutube(videoObj.youtubeUrl, tmpFile, cookieArgs, onDlProgress);
+        }
 
-        // Compute download stats
         const dlDuration = Math.round((Date.now() - downloadStart) / 1000);
         const dlDurationStr = formatDuration(dlDuration);
         const fileSizeBytes = fs.existsSync(tmpFile) ? fs.statSync(tmpFile).size : 0;
         const fileSize = fileSizeBytes ? formatBytes(fileSizeBytes) : '?';
 
-        // Force-update: download done + file stats
-        await forceUpdateLive(
-            `${header}\n\n` +
-            `📥 הורדה ✅ ${dlDurationStr} | ${fileSize}\n` +
-            `☁️ מתחיל העלאה ל-Bunny...`
-        );
-
-        const collectionId = await getOrCreateCollection(videoObj.subCategory);
-
-        const metaTags = Object.keys(videoObj).map(key => ({
-            property: key,
-            value: String(videoObj[key])
-        }));
-
-        console.log('Creating video record...');
-        const createRes = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`,
-            {
-                title: videoObj.lessonTitle,
-                collectionId: collectionId || '',
-                metaTags: metaTags
-            },
-            { headers }
-        );
-        const guid = createRes.data.guid;
-
-        const uploadStart = Date.now();
-        console.log('Uploading to Bunny...');
-        await uploadToBunny(guid, tmpFile, (pct, speed, eta) => {
-            updateLive(
+        // ── Phase 2: Bunny Stream upload (full mode only) ─────────────────
+        let ulDurationStr = null;
+        let streamLine = '';
+        if (!isAudioOnly) {
+            await forceUpdateLive(
                 `${header}\n\n` +
-                `📥 הורדה ✅ ${dlDurationStr} | ${fileSize}\n` +
-                `☁️ *העלאה:* ${pct.toFixed(1)}%\n` +
+                `📥 ${downloadLabel} ✅ ${dlDurationStr} | ${fileSize}\n` +
+                `☁️ מתחיל העלאה ל-Bunny Stream...`
+            );
+
+            const collectionId = await getOrCreateCollection(videoObj.subCategory);
+            const metaTags = Object.keys(videoObj).map(key => ({
+                property: key,
+                value: String(videoObj[key])
+            }));
+
+            console.log('Creating video record...');
+            const createRes = await axios.post(`https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`,
+                {
+                    title: videoObj.lessonTitle,
+                    collectionId: collectionId || '',
+                    metaTags: metaTags
+                },
+                { headers }
+            );
+            const guid = createRes.data.guid;
+
+            const uploadStart = Date.now();
+            console.log('Uploading to Bunny Stream...');
+            await uploadToBunny(guid, tmpFile, (pct, speed, eta) => {
+                updateLive(
+                    `${header}\n\n` +
+                    `📥 ${downloadLabel} ✅ ${dlDurationStr} | ${fileSize}\n` +
+                    `☁️ *Bunny Stream:* ${pct.toFixed(1)}%\n` +
+                    `\`${telegramBar(pct)}\`\n` +
+                    `⚡ ${speed} | ETA ${eta}`,
+                    UPL_THROTTLE_MS
+                );
+            });
+            ulDurationStr = formatDuration(Math.round((Date.now() - uploadStart) / 1000));
+            videoObj.youtubeUrl = `https://iframe.mediadelivery.net/play/${BUNNY_LIBRARY_ID}/${guid}`;
+            streamLine = `☁️ Bunny Stream ✅ ${ulDurationStr}\n`;
+        }
+
+        // ── Phase 3: MP3 extraction ──────────────────────────────────────
+        // ffmpeg on a short rip can complete inside one throttle window, so we
+        // force a "started" and "completed" message regardless of the throttle.
+        const baseSummary =
+            `${header}\n\n` +
+            `📥 ${downloadLabel} ✅ ${dlDurationStr} | ${fileSize}\n` +
+            (streamLine ? streamLine : '');
+
+        await forceUpdateLive(baseSummary + `🎵 *חילוץ אודיו:* התחיל...`);
+
+        const audioStart = Date.now();
+        console.log('Extracting MP3 (64k mono 22050Hz)...');
+        await extractAudio(tmpFile, mp3File, (pct) => {
+            if (pct == null) {
+                updateLive(baseSummary + `🎵 *חילוץ אודיו:* מעבד...`, DL_THROTTLE_MS);
+                return;
+            }
+            updateLive(
+                baseSummary +
+                `🎵 *חילוץ אודיו:* ${pct.toFixed(1)}%\n` +
+                `\`${telegramBar(pct)}\``,
+                DL_THROTTLE_MS
+            );
+        });
+        const audioDur = Math.round((Date.now() - audioStart) / 1000);
+        const audioDurStr = formatDuration(audioDur);
+        const mp3SizeBytes = fs.existsSync(mp3File) ? fs.statSync(mp3File).size : 0;
+        const mp3Size = mp3SizeBytes ? formatBytes(mp3SizeBytes) : '?';
+
+        const afterExtract = baseSummary + `🎵 אודיו ✅ ${audioDurStr} | ${mp3Size}\n`;
+        await forceUpdateLive(afterExtract + `📤 מתחיל העלאה ל-Bunny Storage...`);
+
+        // ── Phase 4: Bunny Storage upload ────────────────────────────────
+        const audioFileName = `audio/${videoObj.slug}.mp3`;
+        const storageStart = Date.now();
+        console.log(`Uploading MP3 to Bunny Storage as ${audioFileName}...`);
+        const audioPublicUrl = await uploadToBunnyStorage(mp3File, audioFileName, (pct, speed, eta) => {
+            updateLive(
+                afterExtract +
+                `📤 *Bunny Storage:* ${pct.toFixed(1)}%\n` +
                 `\`${telegramBar(pct)}\`\n` +
                 `⚡ ${speed} | ETA ${eta}`,
                 UPL_THROTTLE_MS
             );
         });
-        const ulDuration = Math.round((Date.now() - uploadStart) / 1000);
-        const ulDurationStr = formatDuration(ulDuration);
+        const storageDurStr = formatDuration(Math.round((Date.now() - storageStart) / 1000));
+        videoObj.audioUrl = audioPublicUrl;
 
-        const bunnyStreamUrl = `https://iframe.mediadelivery.net/play/${BUNNY_LIBRARY_ID}/${guid}`;
-        videoObj.youtubeUrl = bunnyStreamUrl;
-
+        // ── Wrap up ──────────────────────────────────────────────────────
         const totalDur = formatDuration(Math.round((Date.now() - videoStart) / 1000));
         const completedAfter = completed + 1;
         const overallPctAfter = total > 0 ? Math.round((completedAfter / total) * 100) : 0;
-
-        // Quality actually downloaded: capped at 1080p by the format selector.
-        const downloadedRes = maxRes > 0 ? Math.min(maxRes, 1080) : null;
         const qualityTag = downloadedRes ? ` | 📺 ${downloadedRes}p` : '';
+
         doneText =
             `✅ *הושלם [${videoIndex}/${total}]:* ${title}\n` +
-            `📥 הורדה ✅ ${dlDurationStr} | ${fileSize}${qualityTag}\n` +
-            `☁️ העלאה ✅ ${ulDurationStr}\n` +
+            `📥 ${downloadLabel} ✅ ${dlDurationStr} | ${fileSize}${qualityTag}\n` +
+            (streamLine ? streamLine : '') +
+            `🎵 אודיו ✅ ${audioDurStr} | ${mp3Size}\n` +
+            `📤 Bunny Storage ✅ ${storageDurStr}\n` +
             `⏱️ זמן כולל: ${totalDur}\n` +
             `📊 סה״כ הושלמו: ${completedAfter}/${total} (${overallPctAfter}%)`;
 
         await finalizeLive(doneText);
         console.log(`Done: ${title} (${totalDur})`);
-        return { success: true, videoObj, liveId, doneText, bytes: fileSizeBytes };
+        return { success: true, videoObj, liveId, doneText, bytes: fileSizeBytes + mp3SizeBytes };
 
     } catch (e) {
         console.error(`Failed on video ${title}:`, e.message);
@@ -738,7 +1035,15 @@ async function processVideo(videoObj, cookieArgs, ctx) {
         );
         return { success: false, videoObj, liveId: null, doneText: '', bytes: 0 };
     } finally {
-        if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+        // Cleanup both temp files independently — a failure to delete one
+        // must not block the other, and must not mask the real error.
+        for (const p of [tmpFile, mp3File, partFile]) {
+            try {
+                if (p && fs.existsSync(p)) fs.unlinkSync(p);
+            } catch (cleanupErr) {
+                console.warn(`Cleanup failed for ${p}: ${cleanupErr.message}`);
+            }
+        }
     }
 }
 
@@ -747,6 +1052,18 @@ async function run() {
     // (message id is per-chat but the prev session's UX is over) — start clean.
     writeActiveButtonsId(null);
 
+    // ── Required env vars for the new Bunny Storage pipeline ────────────────
+    const missing = [];
+    if (!BUNNY_STORAGE_API_KEY)  missing.push('BUNNY_STORAGE_API_KEY');
+    if (!BUNNY_STORAGE_ZONE_NAME) missing.push('BUNNY_STORAGE_ZONE_NAME');
+    if (!BUNNY_PULL_ZONE_URL)    missing.push('BUNNY_PULL_ZONE_URL');
+    if (missing.length) {
+        const msg = `Missing required env var(s): ${missing.join(', ')}`;
+        console.error(msg);
+        await sendTelegram(`❌ *משתני סביבה חסרים*\n\`${missing.join(', ')}\`\nהוסף אותם ל-.env ואז Restart.`);
+        throw new Error(msg);
+    }
+
     const filePath = path.join(__dirname, 'playlist.json');
     if (!fs.existsSync(filePath)) {
         return console.error('playlist.json not found');
@@ -754,26 +1071,32 @@ async function run() {
 
     const playlistData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     const total = playlistData.length;
-    let completed = playlistData.filter(v => v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')).length;
+    // Completion now requires BOTH a Bunny Stream URL AND an audioUrl. Entries
+    // that have only the Stream URL count as remaining (audio-only re-process).
+    const isDone = (v) => classifyMode(v) === 'skip' && !!v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net');
+    let completed = playlistData.filter(isDone).length;
     const startedAt = completed; // for session-stats (how many we did THIS run)
     const remaining = total - completed;
-    console.log(`Found ${total} videos in the file. Already completed: ${completed}/${total}.`);
+    const fullCount = playlistData.filter(v => classifyMode(v) === 'full').length;
+    const audioOnlyCount = playlistData.filter(v => classifyMode(v) === 'audio-only').length;
+    console.log(`Found ${total} videos. Done: ${completed}. Pending: full=${fullCount}, audio-only=${audioOnlyCount}.`);
 
     // ── Auth source rotation setup ──────────────────────────────────────────
     // Sticky cookie rotation: cookies1.txt → cookies2.txt → cookies3.txt.
     // Active source stays on whichever last worked; advances only on failure.
+    // Cookies are required only when at least one entry needs the YouTube path.
     const sources = buildAuthSources();
-    if (sources.length === 0) {
+    if (sources.length === 0 && fullCount > 0) {
         const msg = 'No cookie files found (expected cookies1.txt / cookies2.txt / cookies3.txt). Aborting.';
         console.error(msg);
         await sendTelegram(`❌ *אין קבצי cookies*\nהעלה לפחות \`cookies1.txt\` (שלח את הקובץ בטלגרם או הנח על השרת) ואז Restart.`);
         throw new Error(msg);
     }
     let sourceIdx = 0;
-    const activeSource = () => sources[sourceIdx];
+    const activeSource = () => sources[sourceIdx] || null;
     const cookieCount = sources.length;
     console.log(`Auth sources: ${cookieCount} cookie file(s)`);
-    console.log(`Order: ${sources.map(s => s.label).join(' → ')}`);
+    if (cookieCount) console.log(`Order: ${sources.map(s => s.label).join(' → ')}`);
 
     await loadCollections();
 
@@ -787,15 +1110,20 @@ async function run() {
         `🕐 ${nowHHMM()}\n` +
         `📊 סה״כ בפלייליסט: ${total}\n` +
         `✅ כבר הועלו: ${completed}\n` +
-        `⏳ נותרו לעיבוד: ${remaining}\n` +
-        `🍪 ${cookieCount} cookies (לפי סדר): ${sources.map(s => s.label).join(' → ')}`
+        `⏳ נותרו לעיבוד: ${remaining}  (full=${fullCount}, audio-only=${audioOnlyCount})\n` +
+        (cookieCount
+            ? `🍪 ${cookieCount} cookies (לפי סדר): ${sources.map(s => s.label).join(' → ')}`
+            : `🍪 ללא cookies (אין כניסות שדורשות YouTube)`)
     );
 
     for (let i = 0; i < playlistData.length; i++) {
         const video = playlistData[i];
+        const mode = classifyMode(video);
 
-        if (video.youtubeUrl && video.youtubeUrl.includes('mediadelivery.net')) {
-            console.log(`Skipping, already on Bunny: ${video.lessonTitle}`);
+        if (mode === 'skip') {
+            // Either already complete, or invalid URL — log and move on.
+            const reason = video.audioUrl ? 'already complete' : 'invalid/empty youtubeUrl';
+            console.log(`Skipping (${reason}): ${video.lessonTitle || video.videoId}`);
             continue;
         }
 
@@ -808,7 +1136,8 @@ async function run() {
         const startMsg = await sendTelegramMessage(
             `🎬 *[${i + 1}/${total}]* ${title}\n` +
             `📈 התקדמות: ${completed}/${total} (${overallPct}%)\n` +
-            `🕐 ${nowHHMM()}\n\n` +
+            `🕐 ${nowHHMM()}\n` +
+            `🛠️ מצב: ${mode === 'audio-only' ? 'אודיו בלבד (Bunny→MP3)' : 'מלא (YouTube→Stream+MP3)'}\n\n` +
             `📥 מתחיל...`
         );
         const liveId = startMsg?.message_id || null;
@@ -816,34 +1145,41 @@ async function run() {
         const tryWith = async (source) => {
             attempt++;
             if (attempt > 1) {
-                const nextHeb = source.type === 'cookie' ? 'Cookie' : 'ישיר';
-                console.log(`\n🔄 Switching to ${source.type}:${source.label} (attempt ${attempt}) — waiting 30s...`);
+                const nextHeb = source && source.type === 'cookie' ? 'Cookie' : 'ישיר';
+                const label = source ? source.label : '—';
+                console.log(`\n🔄 Switching to ${source ? source.type + ':' + label : 'no-auth'} (attempt ${attempt}) — waiting 30s...`);
                 await sleepWithProgressBar({
                     totalSec: 30,
                     liveId,
                     bodyTop:
                         `🎬 *[${i + 1}/${total}]* ${title}\n` +
-                        `🔄 *מחליף ל-${nextHeb}: ${source.label}*\n` +
+                        `🔄 *מחליף ל-${nextHeb}: ${label}*\n` +
                         `🔁 ניסיון ${attempt}`,
                     tickMs: 5000
                 });
             }
-            return await processVideo(video, buildYtdlpAuthArgs(source), {
+            return await processVideo(video, source ? buildYtdlpAuthArgs(source) : [], {
                 videoIndex: i + 1,
                 total,
                 completed,
-                sourceType: source.type,
-                sourceLabel: source.label,
+                sourceType: source ? source.type : 'none',
+                sourceLabel: source ? source.label : '',
                 attempt,
-                liveId
+                liveId,
+                mode,
             });
         };
 
-        // Try current source; on failure, advance through the remaining sources
-        result = await tryWith(activeSource());
-        while (!result.success && sourceIdx < sources.length - 1) {
-            sourceIdx++;
+        if (mode === 'audio-only') {
+            // Bunny doesn't need cookies — single attempt, no rotation.
+            result = await tryWith(null);
+        } else {
+            // Full mode: try current cookie source; on failure, advance through the rest.
             result = await tryWith(activeSource());
+            while (!result.success && sourceIdx < sources.length - 1) {
+                sourceIdx++;
+                result = await tryWith(activeSource());
+            }
         }
 
         if (result.success) {
@@ -852,7 +1188,7 @@ async function run() {
             console.log(`Progress: ${completed}/${total} videos completed.`);
             fs.writeFileSync(filePath, JSON.stringify(playlistData, null, 2));
 
-            const hasMore = playlistData.slice(i + 1).some(v => !(v.youtubeUrl && v.youtubeUrl.includes('mediadelivery.net')));
+            const hasMore = playlistData.slice(i + 1).some(v => classifyMode(v) !== 'skip');
             if (hasMore) {
                 // Random 2–6 min anti-bot delay; 10s when no-wait mode is on (toggled via Telegram)
                 const noWait = isNoWaitMode();

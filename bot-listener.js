@@ -581,6 +581,11 @@ async function handleUpdate(update) {
                 '/status — סטטוס\n' +
                 '/settings — כוונון מהירות (aria2c + `player_client`)\n' +
                 '/help — עזרה\n\n' +
+                '*צינור עיבוד דו-פורמטי (לכל סרטון):*\n' +
+                '1️⃣ 📥 הורדה — מ-YouTube (חדש) או מ-Bunny Stream (השלמת אודיו)\n' +
+                '2️⃣ ☁️ העלאה ל-Bunny Stream (רק במצב מלא)\n' +
+                '3️⃣ 🎵 חילוץ MP3 (64k mono 22050Hz)\n' +
+                '4️⃣ 📤 העלאה ל-Bunny Storage → שמירת `audioUrl` ב-playlist.json\n\n' +
                 'גם אפשר לשלוח קובץ `.txt` ואני אשמור אותו כ-`cookies1.txt`.'
             );
             break;
