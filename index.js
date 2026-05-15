@@ -592,9 +592,15 @@ function extractBunnyGuid(streamUrl) {
 // ffmpeg input path is stable.
 function downloadFromBunny(streamUrl, outputFile, onProgress) {
     return new Promise((resolve, reject) => {
+        // Bunny Stream is HLS (m3u8 + many small .ts segments). yt-dlp's
+        // native HLS downloader is single-threaded by default, which is the
+        // dominant cause of slow Bunny downloads. --concurrent-fragments
+        // parallelizes segment fetches for a 5-10x speedup. aria2c can't be
+        // used here — it doesn't understand HLS manifests.
         const args = [
             '--no-playlist',
             '-f', 'bestaudio/best',
+            '--concurrent-fragments', '16',
             '--remux-video', 'mp4',
             '--newline',
             '--progress-template', 'PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.status)s',
