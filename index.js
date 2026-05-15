@@ -818,6 +818,34 @@ function classifyMode(videoObj) {
     return 'full';
 }
 
+// Sweep every file in the project root whose name starts with `${stem}.` and
+// delete it. yt-dlp's HLS downloader produces a constellation of side files
+// per download (`{stem}.mp4.part-FragN`, `{stem}.mp4.part-FragN.part`,
+// `{stem}.mp4.ytdl`, `{stem}.temp.mp4`) that the previous narrow cleanup
+// missed — under parallel dispatch with occasional yt-dlp crashes, these
+// accumulate into hundreds of leftover files. Stems are UUIDs / YouTube IDs /
+// slugs, so the prefix is unique enough that this sweep can't collide with
+// unrelated files (cookies.txt, playlist.json, etc).
+function cleanupStemFiles(stem) {
+    if (!stem) return 0;
+    const prefix = `${stem}.`;
+    let removed = 0;
+    try {
+        for (const f of fs.readdirSync(__dirname)) {
+            if (!f.startsWith(prefix)) continue;
+            try {
+                fs.unlinkSync(path.join(__dirname, f));
+                removed++;
+            } catch (cleanupErr) {
+                console.warn(`Cleanup failed for ${f}: ${cleanupErr.message}`);
+            }
+        }
+    } catch (e) {
+        console.warn(`Cleanup readdir failed: ${e.message}`);
+    }
+    return removed;
+}
+
 async function processVideo(videoObj, cookieArgs, ctx) {
     // Stable per-entry filename stem. Falling back through this chain matters
     // for two reasons: (1) empty videoId would resolve to ".mp4" — a hidden
@@ -834,10 +862,11 @@ async function processVideo(videoObj, cookieArgs, ctx) {
     const partFile = `${tmpFile}.part`;
     const title = videoObj.lessonTitle || videoObj.videoId || 'Unknown';
 
-    // Clean up any existing files from previous failed/interrupted attempts
-    if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
-    if (fs.existsSync(partFile)) fs.unlinkSync(partFile);
-    if (fs.existsSync(mp3File)) fs.unlinkSync(mp3File);
+    // Sweep all stale files from prior failed attempts for this stem. Catches
+    // not just .mp4 / .mp3 / .mp4.part but also yt-dlp's .ytdl resume state
+    // and any leftover .mp4.part-FragN fragments — without this, yt-dlp would
+    // try to resume an old session and likely crash on a missing fragment.
+    cleanupStemFiles(stem);
 
     // Header shown at top of every Telegram message for this video
     const { videoIndex, total, completed, sourceType, sourceLabel, attempt, liveId: providedLiveId, mode } = ctx;
@@ -1079,15 +1108,11 @@ async function processVideo(videoObj, cookieArgs, ctx) {
         );
         return { success: false, videoObj, liveId: null, doneText: '', bytes: 0 };
     } finally {
-        // Cleanup both temp files independently — a failure to delete one
-        // must not block the other, and must not mask the real error.
-        for (const p of [tmpFile, mp3File, partFile]) {
-            try {
-                if (p && fs.existsSync(p)) fs.unlinkSync(p);
-            } catch (cleanupErr) {
-                console.warn(`Cleanup failed for ${p}: ${cleanupErr.message}`);
-            }
-        }
+        // Broad sweep: deletes everything matching `{stem}.*` so yt-dlp's
+        // fragment debris (`.part-FragN`, `.part-FragN.part`, `.ytdl`,
+        // `.temp.mp4`) doesn't accumulate when yt-dlp crashes mid-run.
+        const removed = cleanupStemFiles(stem);
+        if (removed > 0) console.log(`Cleaned up ${removed} temp file(s) for ${stem}`);
     }
 }
 
