@@ -1252,18 +1252,8 @@ async function run() {
         const tryWith = async (source) => {
             attempt++;
             if (attempt > 1) {
-                const nextHeb = source && source.type === 'cookie' ? 'Cookie' : 'ישיר';
                 const label = source ? source.label : '—';
-                console.log(`\n🔄 Switching to ${source ? source.type + ':' + label : 'no-auth'} (attempt ${attempt}) — waiting 30s...`);
-                await sleepWithProgressBar({
-                    totalSec: 30,
-                    liveId,
-                    bodyTop:
-                        `🎬 *[${i + 1}/${total}]* ${title}\n` +
-                        `🔄 *מחליף ל-${nextHeb}: ${label}*\n` +
-                        `🔁 ניסיון ${attempt}`,
-                    tickMs: 5000
-                });
+                console.log(`\n🔄 Switching to ${source ? source.type + ':' + label : 'no-auth'} (attempt ${attempt}) — no wait`);
             }
             return await processVideo(video, source ? buildYtdlpAuthArgs(source) : [], {
                 videoIndex: i + 1,
