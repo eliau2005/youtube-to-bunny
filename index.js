@@ -941,15 +941,10 @@ async function processVideo(videoObj, cookieArgs, ctx) {
             console.log('Downloading from YouTube at maximum quality...');
             const maxRes = await listFormats(videoObj.youtubeUrl, cookieArgs);
             if (maxRes > 0 && maxRes < 1080) {
-                // Could be either: (a) cookies session is degraded, or (b) the video
-                // itself was uploaded below 1080p. Ask the user which it is.
-                const choice = await askUserQualityChoice({
-                    liveId, videoIndex, total, title, maxRes
-                });
-                if (choice === 'rotate') {
-                    throw new Error(`User chose to rotate — source offers only ${maxRes}p`);
-                }
-                console.log(`User chose to continue at ${maxRes}p.`);
+                // Source offers less than 1080p — just download what's available
+                // without prompting. The user opted out of the 10s prompt; if a
+                // cookie really is degraded they can Stop+Restart manually.
+                console.log(`Source offers ${maxRes}p — proceeding without prompt.`);
             }
             // Quality actually downloaded: capped at 1080p by the format selector.
             downloadedRes = maxRes > 0 ? Math.min(maxRes, 1080) : null;
@@ -1217,15 +1212,16 @@ async function run() {
         }
         return null;
     };
-    // Inter-video wait fires only when the next pending entry is full-mode.
-    // Audio→Audio skips the wait entirely (Bunny doesn't need anti-bot pacing).
-    // Audio→Full and Full→Full keep the 2-6 min (or 10s no-wait) cooling-off.
+    // Inter-video wait fires only when the next pending entry is full-mode AND
+    // no-wait mode is OFF. Audio→Audio skips entirely (Bunny doesn't need
+    // anti-bot pacing). When no-wait is on the wait is zero — the user has
+    // explicitly opted out of the cooling-off period.
     const maybeInterVideoWait = async (i, doneText, liveId) => {
         const nextMode = nextPendingMode(i);
         if (nextMode !== 'full') return;
-        const noWait = isNoWaitMode();
-        const delaySec = noWait ? 10 : Math.floor(Math.random() * (360 - 120 + 1)) + 120;
-        console.log(`\n⏱️  Waiting ${noWait ? '10s (no-wait mode)' : (delaySec / 60).toFixed(1) + ' min'} before next download...`);
+        if (isNoWaitMode()) return;
+        const delaySec = Math.floor(Math.random() * (360 - 120 + 1)) + 120;
+        console.log(`\n⏱️  Waiting ${(delaySec / 60).toFixed(1)} min before next download...`);
         await sleepWithProgressBar({
             totalSec: delaySec,
             liveId,
