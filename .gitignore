@@ -8,6 +8,9 @@ yarn.lock
 .env.local
 .env.*.local
 
+# Playlist data (runtime state / datasets)
+playlist*.json
+
 # Logs
 *.log
 npm-debug.log*
